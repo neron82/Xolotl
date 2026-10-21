@@ -48,6 +48,9 @@ struct NativeFmt {
     /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
     /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
     size_t tail_off = 0;
+    /// EXL3 expert classes (DeepSeek-V4.1 SAGE): set by ds41_moe_class_layout.  The GPU path reads it, the CPU
+    /// kernels do not; gu_type/d_type are kTypeEXL3 and the row fields are unused.
+    bool exl3 = false;
 };
 constexpr int kNvfp4Type = 40;
 constexpr size_t kNvfp4Tail = 16;

@@ -1,8 +1,9 @@
 // tools/v41/engine/ds41_engram.hpp - DeepSeek-V4.1 Engram: the n-gram hash (model.py / engram.py NgramHashState)
-// and the row reader.  The tables are NOT copied anywhere: rows are read straight from the HF safetensors shards
-// (layers.{1,14}.engram.embed.weight F8_E4M3 [rows, 256] + .scale F8_E8M0 [rows, 8]), two small preads per row,
-// in parallel.  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
-// exactly representable in bf16, so model.py's bf16 cast is a no-op on them).
+// and the row reader.  The tables are NOT copied anywhere: rows are read straight from their source - either the HF
+// safetensors shards (layers.{1,14}.engram.embed.weight F8_E4M3 [rows, 256] + .scale F8_E8M0 [rows, 8], two small
+// preads per row) or the model GGUF's own blk.N.engram_embd.weight Q8_0 / Q6_K tensors (272 / 210-byte
+// rows at dim 256), in parallel.  A row dequantizes to 256 floats (model.py ParallelEngramEmbedding; the HF
+// values are exactly representable in bf16, so model.py's bf16 cast is a no-op on them).
 //
 // rows()/start() are the fast batch reader: hashes are deduped and sorted by row id, so per row the two preads come out
 // ascending and the unique rows whose bytes share a 4 KiB page are one pread - which on the exFAT volume the tables live
@@ -32,6 +33,10 @@ public:
     ~Ds41Engram();
     /// dirs: where the shards are (the index json is looked up in each, the shard files too).
     bool open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err);
+    /// Rows straight out of the model GGUF: blk.N.engram_embd.weight, Q8_0 or Q6_K.
+    /// rows_limit caps the readable rows (0 = the tensor's own row count); a row whose hashed
+    /// index is past the cap reads as zeros.  Used for partial / dev files.
+    bool open_gguf(const Ds41Geometry & g, const GgufModel & m, int64_t rows_limit, int threads, std::string & err);
     bool enabled() const { return !tables_.empty(); }
     int64_t n_cols() const { return cols_; }                    ///< hash columns per token per layer (24)
     int64_t row_dim() const { return dim_; }                    ///< 256
@@ -64,24 +69,37 @@ public:
     uint64_t cache_misses() const { return cache_miss_; }
 
 private:
+    // One Engram table's source.  HF: fd_w = the F8_E4M3 weight blob, fd_s = the F8_E8M0 scale blob (row_bytes = dim +
+    // dim/32, read as two spans).  GGUF (open_gguf): both fds are the model shard holding blk.N.engram_embd.weight,
+    // off_w = the quantized payload, row_bytes follows that table's block geometry (272 for Q8_0 / 210 for Q6_K
+    // at dim 256). There is a single span and the scale span is empty. `rows` is the readable row count (the
+    // tensor's own count, or the rows_limit cap); `clamp` = hashed rows at or past `rows` read as zeros.
     struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0;
+                   int64_t row_bytes = 0; bool gguf = false, clamp = false;
+                   int block_elems = 0, block_bytes = 0;
+                   void (*dequantize)(const uint8_t *, float *) = nullptr;
                    std::shared_ptr<RawMap> rm_w, rm_s; };
     struct ReadGroup;               // one coalesced pread (defined in the .cpp)
     const Ds41Geometry * g_ = nullptr;
     std::vector<Table> tables_;
-    // Row cache: raw rows (dim weight bytes + dim/32 scale bytes) already read, keyed (layer slot << 32 | row).  Filled
-    // by every read until `cache_cap_` rows (STRATA_ENGRAM_CACHE_ROWS, default 2M ~ 0.6 GB; 0 = off), never evicted:
+    // Row cache: raw rows (row_bytes bytes each: HF weight+scale, GGUF Q8_0 / Q6_K) already read,
+    // keyed (layer slot << 32 | row) with byte offsets into the packed pool. Filled until `cache_cap_` rows
+    // (STRATA_ENGRAM_CACHE_ROWS, default 2M ~ 0.6 GB; 0 = off), never evicted:
     // a prompt's rows are all cached as it is read, so decode n-grams that repeat the context skip the disk (the Engram
     // table sits on exFAT here: ~13K random reads/s - a decode token's ~48 reads cost ~10 ms cold).
-    std::unordered_map<uint64_t, uint32_t> cache_idx_;
+    std::unordered_map<uint64_t, size_t> cache_idx_;
     std::vector<uint8_t> cache_pool_;
-    size_t cache_cap_ = 0, cache_used_ = 0;
+    size_t cache_cap_ = 0, cache_used_ = 0, cache_bytes_used_ = 0;
     uint64_t cache_hits_ = 0, cache_miss_ = 0;
     std::mutex cache_mu_;
     std::vector<int64_t> hist_;      // compressed ids by position
     std::vector<int64_t> offsets_;   // [slot * cols + col] bucket range start
     int64_t cols_ = 0, dim_ = 0;
     uint64_t bytes_ = 0, reads_ = 0;
+    // Dequantize one table's raw row (HF weight+scale, or a GGUF quantized row) into dim floats.
+    void decode_row(const Table & table, const uint8_t * raw, float * out) const;
+    // Start the reader pool and size the row cache; identical for both sources.
+    void setup_pool_cache(int threads);
 
     // A fixed I/O pool with a FIFO job queue.  The row reads are latency-bound, so the pool is the disk's queue depth:
     // a batch fires one job per worker and the jobs steal chunks of the batch's read list.  Backs both rows()/start()

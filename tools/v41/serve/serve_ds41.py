@@ -166,6 +166,9 @@ class Ds41Template:
 
     def render(self, messages, tools=None, add_generation_prompt=True, **kw):
         mode = "chat" if kw.get("enable_thinking") is False else "thinking"
+        # Keep the reference drop_thinking policy: an old <think> generation marker becomes </think>
+        # on the next user turn. The engine checkpoints BEFORE that final token; retaining hidden
+        # reasoning here to manufacture a cache hit would change the model's conversation.
         prompt = E.encode_messages(to_encoder_messages(messages, tools), thinking_mode=mode,
                                    reasoning_effort=_level(kw.get("reasoning_effort")))
         if not add_generation_prompt:

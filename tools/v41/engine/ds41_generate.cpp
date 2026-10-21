@@ -7,7 +7,13 @@
 //                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
-//                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
+//                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F] [--split K[,K2..] [--split-device D1,D2,..]]
+// --split K[,K2..] runs the model across GPUs as contiguous layer ranges (upstream --layer-split, src/program/generate.cpp): K is the FIRST
+// layer of each later stage, not a count of layers per card. Stage s > 0 lives on --split-device ordinal s (default 1,2,3,..;
+// --split-device 0 with one K runs both stages on card 0 - the bit-exact A/B of the hand-off). Needs --backend cuda and --experts gpu;
+// 1..7 split points, rising, each >= 2 and < n_layer, and a state-closed boundary: every later layer's kv / index source and the
+// candidate block stay on the same side (for the 40-layer file: 2, 8, 14, 20). NOT supported with a split: --prompt-batch > 1 (the
+// layer-major batch has no mid-model start), vision (--vision / GENI), DSpark (STRATA_DSPARK / STRATA_SERVE_DSPARK).
 // --enc-skip (layer-major batches only; DEFAULT for one-shot runs, --no-enc-skip = full path): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
 // after layer 20's persistent-KV writes; only the last 2560 tokens run layers 21-39.  Same last-token logits / decode.
 //
@@ -32,6 +38,14 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+
+// per-stage allocations under a --split run happen with that stage's CUDA device current (the same placement the
+// tier uses for cfg.device).  A CPU-only build has no CUDA to place on; --split is refused there (--backend cuda).
+#if defined(__has_include) && __has_include(<cuda_runtime.h>)
+#include "strata/core/on_device.hpp"
+#else
+namespace strata::core { struct OnDevice { explicit OnDevice(int) {} OnDevice(const OnDevice &) = delete; OnDevice & operator=(const OnDevice &) = delete; }; }
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -60,6 +74,7 @@ namespace {
 struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
     std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
+    std::string exl3_dir;         // --exl3-dir DIR: SAGE EXL3 routed experts; --model stays the dense/Engram GGUF
     double mirror_gib = 85.0;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
@@ -89,6 +104,8 @@ struct Args {
     double chunk_prefetch_gib = 0.0;
     int image_token = 129264;     // --image-token N: the model's <|image|> id (each image is one run of it in the prompt)
     bool vision = false;
+    std::string layer_split;     // --split K[,K2..]: the FIRST layer of each later GPU stage (not counts), upstream --layer-split
+    std::string split_device;    // --split-device D1,D2,..: CUDA ordinal per later stage; default 1,2,3,..; 0 with one K = both on card 0
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -165,6 +182,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--backend") a.backend = next();
         else if (k == "--experts") a.experts = next();
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ':')) a.engram.push_back(d); }
+        else if (k == "--exl3-dir") a.exl3_dir = next();
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
@@ -211,6 +229,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
         else if (k == "--image-token") a.image_token = std::atoi(next().c_str());
         else if (k == "--vision") a.vision = true;
+        else if (k == "--split") a.layer_split = next();
+        else if (k == "--split-device") a.split_device = next();
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
@@ -299,6 +319,21 @@ double log_softmax_at(const float * lg, int nv, int tok) {
 
 }  // namespace
 
+// One GPU stage of a --split run: its own backend (by CUDA ordinal), blob source, dense half and expert tier,
+// each holding one contiguous block range [lb, le).  With no split there is exactly one stage and it is the whole
+// model: dev -1 (the caller's current device, as today), range unset, every engine call as before.
+struct Ds41Stage {
+    int dev = -1;                    // CUDA ordinal; -1 = CPU
+    ggml_backend_t be = nullptr;
+    ggml_backend_dev_t bdev = nullptr;
+    std::unique_ptr<Ds41FileBlobs> src;
+    Ds41Dense dense;
+    Ds41MoeTier tier;
+    int64_t lb = 0, le = 0;          // blocks this stage runs
+    float * rdev = nullptr;          // this stage's routed-sum device rows
+    double free_gib = 0, slot_gib = 0;   // measured after this stage's dense half (the split log line)
+};
+
 int main(int argc, char ** argv) {
     if (!std::getenv("DS41_GGML_DEBUG"))
         ggml_log_set([](ggml_log_level lv, const char * text, void *) { if (lv != GGML_LOG_LEVEL_DEBUG) std::fputs(text, stderr); }, nullptr);
@@ -338,11 +373,98 @@ int main(int argc, char ** argv) {
     }
     std::mt19937_64 rng(a.seed);
 
+    // ---- layer split (upstream --layer-split, src/program/generate.cpp:2360): K = the FIRST layer of each later
+    // stage, not a count.  Validated before any dense half is built: the state-closed test reads only the GGUF
+    // header (GgufModel mmaps it), so a bad K fails with the legal set printed, not a half-loaded model.
+    std::vector<int> split_at, split_devs;
+    const bool split = !a.layer_split.empty();
+    if (!a.split_device.empty() && !split) { std::fprintf(stderr, "ds41_generate: --split-device needs --split\n"); return 2; }
+    if (split) {
+        auto ints = [](const std::string & s, std::vector<int> & out) -> bool {
+            size_t p = 0;
+            while (p < s.size()) {
+                size_t q = s.find(',', p);
+                if (q == std::string::npos) q = s.size();
+                const std::string t = s.substr(p, q - p);
+                if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) return false;
+                out.push_back(std::atoi(t.c_str()));
+                p = q + 1;
+            }
+            return !out.empty();
+        };
+        if (!ints(a.layer_split, split_at) || split_at.size() > 7) {
+            std::fprintf(stderr, "ds41_generate: --split wants 1..7 rising layer ids (K = the FIRST layer of each "
+                                 "later stage, not a count: \"20,36\" for three stages, not \"20,16\")\n");
+            return 2;
+        }
+        if (!a.split_device.empty() && !ints(a.split_device, split_devs)) { std::fprintf(stderr, "ds41_generate: --split-device wants a comma list of CUDA ordinals\n"); return 2; }
+        if (split_devs.empty()) for (int d = 1; d <= (int) split_at.size(); ++d) split_devs.push_back(d);   // default 1, 2, 3, ..
+        if (split_devs.size() != split_at.size()) { std::fprintf(stderr, "ds41_generate: --split-device wants one ordinal per --split point (%zu K, %zu devices)\n", split_at.size(), split_devs.size()); return 2; }
+        if (a.backend != "cuda") { std::fprintf(stderr, "ds41_generate: --split needs --backend cuda\n"); return 2; }
+        if (a.experts == "cpu") { std::fprintf(stderr, "ds41_generate: --split needs --experts gpu (the CPU expert tier has no per-stage device)\n"); return 2; }
+        if (a.prompt_batch > 1) { std::fprintf(stderr, "ds41_generate: --split does not support --prompt-batch > 1: the layer-major batch has no mid-model start\n"); return 2; }
+        if (a.vision) { std::fprintf(stderr, "ds41_generate: --split does not support --vision\n"); return 2; }
+        if (std::getenv("STRATA_DSPARK") || std::getenv("STRATA_SERVE_DSPARK")) { std::fprintf(stderr, "ds41_generate: --split does not support DSpark (STRATA_DSPARK / STRATA_SERVE_DSPARK)\n"); return 2; }
+        // state-closed boundary: every layer at or past K reads only state written at or past K (kv_src / idx_src
+        // -1 = the layer owns its full KV / its own indexer and reads neither), and the candidate block written at
+        // cand_layer - read by every later indexer - stays whole: K at or below it, or past the last index source.
+        Ds41Geometry VG;
+        if (std::string gerr = ds41_read_geometry(GgufModel::open(a.model), VG); !gerr.empty()) {
+            std::fprintf(stderr, "ds41_generate: --split: %s: %s\n", a.model.c_str(), gerr.c_str());
+            return 1;
+        }
+        const int64_t nlay = VG.n_layer;
+        auto legal = [&](int64_t K) {
+            for (int64_t l = K; l < nlay; ++l) {
+                const int64_t kv = VG.kv_src(l), ix = VG.idx_src(l);
+                if ((kv >= 0 && kv < K) || (ix >= 0 && ix < K)) return false;
+            }
+            return VG.index_sources.empty() || K <= VG.cand_layer || K > VG.index_sources.back();
+        };
+        for (size_t i = 0; i < split_at.size(); ++i) {
+            const int K = split_at[i];
+            if (K < 2 || K >= nlay || (i > 0 && K <= split_at[i - 1])) {
+                std::fprintf(stderr, "ds41_generate: --split: K %d must be >= 2, below n_layer (%lld) and rising\n", K, (long long) nlay);
+                return 2;
+            }
+            if (!legal(K)) {
+                std::string set;
+                for (int64_t k = 2; k < nlay; ++k) if (legal(k)) { if (!set.empty()) set += ", "; set += std::to_string(k); }
+                std::fprintf(stderr, "ds41_generate: --split: K %d is not a state-closed boundary (some later layer reads kv / index "
+                                     "state written before it, or it splits the candidate block); legal for this file: %s\n",
+                             K, set.c_str());
+                return 2;
+            }
+        }
+        // devices: CUDA-registry ordinals, each < the registry's count, distinct from each other.  Stage 0 runs
+        // CUDA0 (init_by_type picks the first GPU), so 0 joins the list only when named (--split-device 0: the
+        // same-card A/B of the hand-off)
+        ggml_backend_reg_t creg = ggml_backend_reg_by_name("CUDA");
+        const size_t ndev = creg ? ggml_backend_reg_dev_count(creg) : 0;
+        for (size_t i = 0; i < split_devs.size(); ++i) {
+            if ((size_t) split_devs[i] >= ndev) { std::fprintf(stderr, "ds41_generate: --split-device: CUDA%d: the CUDA registry has %zu device(s)\n", split_devs[i], ndev); return 2; }
+            for (size_t j = 0; j < i; ++j)
+                if (split_devs[j] == split_devs[i]) { std::fprintf(stderr, "ds41_generate: --split-device: CUDA%d would run two stages\n", split_devs[i]); return 2; }
+        }
+        std::string devs;
+        for (const int d : split_devs) devs += (devs.empty() ? "" : ",") + std::to_string(d);
+        std::fprintf(stderr, "ds41_generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
+                     split_devs.size() + 1, devs.c_str(), a.layer_split.c_str());
+    }
+
     // ---- dense half
+    // one stage per GPU under --split; exactly one stage (the whole model, dev -1 = the caller's current device)
+    // without it.  The dense / tier / src bindings below name stage 0, so the no-split path keeps every call site.
+    std::vector<std::unique_ptr<Ds41Stage>> stages;
+    stages.push_back(std::make_unique<Ds41Stage>());
+    stages[0]->src = std::make_unique<Ds41FileBlobs>(a.model);
     ggml_backend_t be = a.backend == "cuda" ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr)
                                             : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!be) { std::fprintf(stderr, "ds41_generate: no %s backend\n", a.backend.c_str()); return 1; }
     if (ggml_backend_is_cpu(be)) ggml_backend_cpu_set_n_threads(be, a.threads > 0 ? a.threads : 8);
+    stages[0]->be = be;
+    stages[0]->bdev = ggml_backend_get_device(be);
+    stages[0]->dev = split ? 0 : -1;   // stage 0 runs CUDA0 (init_by_type picks the first GPU)
     int64_t ctx = a.ctx > 0 ? a.ctx : (int64_t) prompt.size() + a.n_predict + 64;
     ctx = std::max<int64_t>(4096, (ctx + 255) / 256 * 256);
     Ds41DenseConfig dc;
@@ -356,6 +478,7 @@ int main(int argc, char ** argv) {
     const int S = a.prefill_chunk > 0 ? a.prefill_chunk : (a.prompt_batch > 0 ? 512 : 1);
     dc.max_pass = S;
     dc.prompt_batch = PB;
+    if (split) dc.layer_le = split_at[0];   // stage 0 loads [0, K0) + token_embd; the head goes to the last stage
     // --serve: elastic state columns (STRATA_ELASTIC_COLS=0 = the fixed prompt_batch columns): decode keeps S columns and
     // the ~0.31 MiB a column of a big prompt batch (2.6 GiB at 8192) goes to VRAM expert slots; a layer-major batch
     // grows them (the VRAM cache is released for it anyway) and gives them back.  s11: 2.6 GiB of slots = 10-20% of a
@@ -377,15 +500,20 @@ int main(int argc, char ** argv) {
     if (enc_skip && PB <= 1) { std::fprintf(stderr, "ds41_generate: --enc-skip needs the layer-major prompt path (--prompt-batch >= 2)\n"); return 2; }
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
+    dc.external_experts = !a.exl3_dir.empty();
     dc.vision = a.vision;
     dc.act_quant = a.act_quant;
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
     dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
     if (dc.kv_fp4) std::fprintf(stderr, "kv: compressed KV NVFP4 + indexer keys MXFP4 (--kv-fp4, exact)\n");
-    Ds41Dense dense;
+    Ds41Dense & dense = stages[0]->dense;   // no split: stage 0 IS the whole model, so every single-object use below stays correct
+    Ds41MoeTier & tier = stages[0]->tier;
+    Ds41FileBlobs & src = *stages[0]->src;
     std::string err;
     const double t_load = now_ms();
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
+    stages[0]->lb = dense.layer_lb();
+    stages[0]->le = dense.layer_le();
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
     // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
@@ -401,21 +529,33 @@ int main(int argc, char ** argv) {
         ER = reach;
     }
     if (enc_skip) std::fprintf(stderr, "enc-skip: cut at layer %d (last kv source), replay window %lld (reach %lld)\n", CL, (long long) ER, (long long) reach);
-    if (a.engram.empty()) std::fprintf(stderr, "WARNING: no --engram dirs: the Engram add is skipped (not the real model)\n");
+    if (a.engram.empty() && G.engram_tables.empty())
+        std::fprintf(stderr, "WARNING: no --engram dirs and the file carries no Engram tables: the Engram add is skipped (not the real model)\n");
 
     // ---- routed experts
-    Ds41FileBlobs src(a.model);
-    if (!src.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
+    if (a.exl3_dir.empty()) {
+        if (!src.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
+    } else {
+        Ds41MoeGeom base;
+        base.n_embd = G.n_embd;
+        base.n_ff = G.n_ff;
+        base.n_layers = G.n_layer;
+        base.n_experts = G.n_expert;
+        base.top_k = G.n_used;
+        if (G.swiglu_limit > 0) base.swiglu_limit = (float) G.swiglu_limit;
+        if (!src.open_exl3(a.exl3_dir, base, err)) { std::fprintf(stderr, "ds41_generate: EXL3 experts: %s\n", err.c_str()); return 1; }
+    }
     const Ds41MoeGeom & TG = src.geom();
     double slot_gib = 0;
     if (a.experts != "cpu" && !ggml_backend_is_cpu(be)) {
         size_t fr = 0, tot = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
         slot_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+        stages[0]->free_gib = (double) fr / 1073741824.0;
+        stages[0]->slot_gib = slot_gib;
         std::fprintf(stderr, "VRAM: %.2f GiB free after the dense half -> %.2f GiB of expert slots (margin %.2f)\n",
                      fr / 1073741824.0, slot_gib, a.vram_margin_gib);
     }
-    Ds41MoeTier tier;
     Ds41MoeConfig mc;
     mc.cpu_only = a.experts == "cpu" || ggml_backend_is_cpu(be);
     mc.slots = a.slots > 0 ? a.slots : TG.n_layers * TG.n_experts;
@@ -453,13 +593,71 @@ int main(int argc, char ** argv) {
                      a.prune_penalty > 0 ? ("penalised -" + std::to_string(a.prune_penalty)).c_str() : "masked out of routing", a.prune.c_str());
         mc.exclude = pruned;
     }
+    if (split) {   // stage 0's tier: CUDA0, its own layer range, slots capped to that range's experts
+        mc.device = 0; mc.layer_lb = 0; mc.layer_le = split_at[0];
+        if (a.slots == 0) mc.slots = (int64_t) split_at[0] * TG.n_experts;
+    }
+    // The prompt's chunk/graph buffers take the VRAM first and the cache opens into what is left (the
+    // mixed-size path always did this through its seed).  Tell the tier too: a uniform-blob model would
+    // otherwise open its cache at init and leave the prompt nothing to allocate in (1017 IQ2_XXS: 13.37 GiB
+    // of slots, 0.88 GiB free, c_stage OOM on a 1024-token prompt).
+    const bool defer_vram = !mc.cpu_only && (a.prefill_chunk > 1 || a.prompt_batch > 1);
+    mc.defer_cache = defer_vram;
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
-    dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
+    if (split) {
+        // ---- the later stages: backend by CUDA ordinal (registry device -> dev_init), own blob source, dense
+        // half for [lb, le) only, own expert tier on that card.  Every allocation runs under OnDevice(ordinal);
+        // each hand-off buffer is allocated by the stage that WRITES it (pinned + mapped + portable, the pattern
+        // at src/program/generate.cpp:7818) and the reader gets its device pointer.
+        const size_t nstages = split_at.size() + 1;
+        stages.reserve(nstages);
+        { strata::core::OnDevice od(0); if (!dense.open_handoff(err)) { std::fprintf(stderr, "ds41_generate: stage 0 hand-off: %s\n", err.c_str()); return 1; } }
+        ggml_backend_reg_t sreg = ggml_backend_reg_by_name("CUDA");
+        for (size_t si = 1; si < nstages; ++si) {
+            const int dev = split_devs[si - 1];
+            const int64_t lb = split_at[si - 1], le = si < split_at.size() ? split_at[si] : n_layer;
+            auto st = std::make_unique<Ds41Stage>();
+            st->dev = dev; st->lb = lb; st->le = le;
+            st->bdev = ggml_backend_reg_dev_get(sreg, (size_t) dev);
+            strata::core::OnDevice od(dev);
+            st->be = ggml_backend_dev_init(st->bdev, nullptr);
+            if (!st->be) { std::fprintf(stderr, "ds41_generate: stage %zu: no CUDA%d backend\n", si, dev); return 1; }
+            st->src = std::make_unique<Ds41FileBlobs>(a.model);
+            if (a.exl3_dir.empty() ? !st->src->open(err) : !st->src->open_exl3(a.exl3_dir, TG, err)) {
+                std::fprintf(stderr, "ds41_generate: stage %zu experts: %s\n", si, err.c_str());
+                return 1;
+            }
+            Ds41DenseConfig sd = dc;
+            sd.backend = st->be; sd.layer_lb = lb; sd.layer_le = le;
+            if (!st->dense.init(a.model, sd, err)) { std::fprintf(stderr, "ds41_generate: stage %zu dense: %s\n", si, err.c_str()); return 1; }
+            st->dense.set_handoff_in(stages[si - 1]->dense.handoff_dev());   // read the previous stage's buffer
+            if (le < n_layer && !st->dense.open_handoff(err)) { std::fprintf(stderr, "ds41_generate: stage %zu hand-off: %s\n", si, err.c_str()); return 1; }
+            size_t fr = 0, tot = 0;
+            ggml_backend_dev_memory(st->bdev, &fr, &tot);
+            st->free_gib = (double) fr / 1073741824.0;
+            st->slot_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+            Ds41MoeConfig sm = mc;
+            sm.device = dev; sm.layer_lb = lb; sm.layer_le = le;
+            sm.slots = a.slots > 0 ? a.slots : (le - lb) * TG.n_experts;   // this range's experts, not the model's
+            sm.slot_gib = a.slots > 0 ? 0.0 : st->slot_gib;
+            if (!st->tier.init(TG, st->src.get(), sm, err)) { std::fprintf(stderr, "ds41_generate: stage %zu tier init: %s\n", si, err.c_str()); return 1; }
+            st->rdev = std::getenv("STRATA_DEC_HOSTSUM") ? nullptr : st->dense.routed_dev();
+            std::fprintf(stderr, "stage %zu: CUDA%d dense + tier for layers %lld-%lld ready (%.2f GiB free after the dense half)\n",
+                         si, dev, (long long) lb, (long long) (le - 1), st->free_gib);
+            stages.push_back(std::move(st));
+        }
+    }
+    for (auto & S : stages) S->dense.set_oom_hook([&S]() { return S->tier.release_prestage(); });   // a prompt pass that does not fit: that stage's prestage gives way
     // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
     // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
     // per request: a multi-token prompt closes the cache (release_cache), the decode after it re-seeds (~0.6 s)
-    const bool defer_vram = !mc.cpu_only && (a.prefill_chunk > 1 || a.prompt_batch > 1);
     std::vector<std::pair<int32_t, int32_t>> ranked;
+    // each stage seeds from the ranked list filtered to its own layers; the global list stays for the bias / proxy logic
+    auto ranked_for = [&](const Ds41Stage & S) {
+        std::vector<std::pair<int32_t, int32_t>> v;
+        for (const auto & p : ranked) if (p.first >= S.lb && p.first < S.le) v.push_back(p);
+        return v;
+    };
     if (!mc.cpu_only) {
         if (!a.rank.empty()) {
             ranked = ds41_read_ranked(a.rank, err);
@@ -468,15 +666,62 @@ int main(int argc, char ** argv) {
             for (int64_t l = 0; l < TG.n_layers; ++l)
                 for (int64_t e = 0; e < TG.n_experts; ++e) ranked.emplace_back((int32_t) l, (int32_t) e);
         }
-        const double t0 = now_ms();
-        if (defer_vram ? !tier.build_arena_ranked(ranked, err) : !tier.seed_from_ranked(ranked, err)) {
-            std::fprintf(stderr, "ds41_generate: seed: %s\n", err.c_str());
-            return 1;
+        for (size_t si = 0; si < stages.size(); ++si) {
+            Ds41Stage & S = *stages[si];
+            const double t0 = now_ms();
+            // A split sizes each stage's cache against the VRAM free on ITS OWN card at the moment it seeds:
+            // the figure taken at stage construction predates the later stages' dense halves and this stage's
+            // tier buffers, so on one card (--split-device 0) stage 0 measured 15.58 GiB free, seeded 14.58
+            // GiB of slots, and by seed time the card held 10.91.  Stages that share a card divide what is
+            // left by their layer counts, and a stage left with no room runs its arena / file tier with the
+            // cache off - the tier reads slot_gib 0 as "no budget", so 0 is said out loud, not implied.
+            // Without a split the single stage keeps the figure above, byte for byte as today.
+            if (split) {
+                size_t fr = 0, tot = 0;
+                { strata::core::OnDevice od(S.dev); ggml_backend_dev_memory(S.bdev, &fr, &tot); }
+                double room = ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0;
+                int64_t mine = 0, shared = 0;
+                for (auto & Q : stages)
+                    if (Q->dev == S.dev) { shared += Q->le - Q->lb; if (Q.get() == &S) ++mine; }
+                if (shared > (int64_t) stages.size() && mine == 1 && room > 0)
+                    room *= (double) (S.le - S.lb) / (double) shared;
+                S.slot_gib = a.slots > 0 ? 0.0 : std::max(0.0, std::min(S.slot_gib, room));
+                if (a.slots == 0 && S.slot_gib <= 0.0) S.tier.set_cache_enabled(false);
+                else S.tier.set_slot_gib(S.slot_gib);
+            }
+            if (defer_vram ? !S.tier.build_arena_ranked(ranked_for(S), err) : !S.tier.seed_from_ranked(ranked_for(S), err)) {
+                std::fprintf(stderr, "ds41_generate: seed: %s\n", err.c_str());
+                return 1;
+            }
+            if (stages.size() > 1)
+                std::fprintf(stderr, "tier[stage %zu CUDA%d layers %lld-%lld]: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
+                             si, S.dev, (long long) S.lb, (long long) (S.le - 1), (long long) S.tier.resident(),
+                             (long long) S.tier.arena_experts(), S.tier.arena_gib(), (long long) S.tier.file_tier(), (now_ms() - t0) / 1000.0);
+            else
+                std::fprintf(stderr, "tier: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
+                             (long long) S.tier.resident(), (long long) S.tier.arena_experts(), S.tier.arena_gib(), (long long) S.tier.file_tier(), (now_ms() - t0) / 1000.0);
         }
-        std::fprintf(stderr, "tier: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
-                     (long long) tier.resident(), (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
-                     (now_ms() - t0) / 1000.0);
     }
+    // the stage that owns layer l: per-layer tier / dense queries (resident, in_arena, set_route_bias) go to it
+    auto stage_at = [&](int64_t l) -> Ds41Stage & {
+        for (auto & S : stages) if (l >= S->lb && l < S->le) return *S;
+        return *stages.back();
+    };
+    // per-stage fan-out: with one stage each of these is exactly the single call it is today
+    auto sum_resident = [&]() { int64_t n = 0; for (auto & S : stages) n += S->tier.resident(); return n; };
+    auto sum_arena = [&]() { int64_t n = 0; for (auto & S : stages) n += S->tier.arena_experts(); return n; };
+    auto sum_stats = [&]() { Ds41MoeStats t; for (auto & S : stages) t.add(S->tier.stats()); return t; };
+    auto each_tier = [&](auto fn) { for (auto & S : stages) fn(S->tier); };
+    auto all_restore = [&]() { for (auto & S : stages) if (!S->dense.restore()) return false; return true; };
+    auto all_park = [&](int64_t rows) { for (auto & S : stages) if (!S->dense.park(rows)) return false; return true; };
+    auto all_unpark = [&]() { for (auto & S : stages) if (!S->dense.unpark()) return false; return true; };
+    auto all_snapshot = [&](int pos) { for (auto & S : stages) if (!S->dense.snapshot(pos)) return false; return true; };
+    auto all_snapshot_prefix = [&](int pos) { for (auto & S : stages) if (!S->dense.snapshot_prefix(pos)) return false; return true; };
+    auto all_restore_prefix = [&]() { for (auto & S : stages) if (!S->dense.restore_prefix()) return false; return true; };
+    auto all_drop_park = [&]() { for (auto & S : stages) S->dense.drop_park(); };
+    auto all_clear_vision = [&]() { for (auto & S : stages) S->dense.clear_vision(); };
+    auto all_release_pass = [&]() { for (auto & S : stages) S->dense.release_pass(); };
+    auto all_prof_report = [&](const char * tag) { for (auto & S : stages) S->dense.prof_report(tag); };
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
     std::vector<char> proxy_res;   // --bias-prompt: the would-be VRAM set (first N ranked) until the real seed
     if (a.bias_prompt > 0) {
@@ -489,7 +734,7 @@ int main(int argc, char ** argv) {
         }
     }
     auto resident_now = [&](int64_t l, int64_t e) {
-        return proxy_res.empty() ? tier.resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
+        return proxy_res.empty() ? stage_at(l).tier.resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
     };
     // bias_now: route-bias / file penalty are DECODE levers - before the VRAM seed (the prompt) only the prune part
     // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
@@ -500,17 +745,25 @@ int main(int argc, char ** argv) {
         if (!want && !bias_set) return;
         bias_set = want;
         std::vector<float> rb((size_t) TG.n_experts);
-        for (int64_t l = 0; l < TG.n_layers; ++l) {
-            for (int64_t e = 0; e < TG.n_experts; ++e)
-                rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
-                               : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
-                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
-            dense.set_route_bias((int) l, rb.data());
+        for (auto & P : stages) {   // each stage sets the bias on its own layers (set_route_bias rejects the rest)
+            for (int64_t l = P->lb, lend = std::min<int64_t>(P->le, TG.n_layers); l < lend; ++l) {
+                for (int64_t e = 0; e < TG.n_experts; ++e)
+                    rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
+                                   : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
+                                   : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !stage_at(l).tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+                P->dense.set_route_bias((int) l, rb.data());
+            }
         }
     };
     apply_bias();   // the prune part now (the prompt routes with it); route_bias again once the VRAM cache is seeded
     std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, experts %s, %zu classes\n",
                  (now_ms() - t_load) / 1000.0, n_layer, (long long) ctx, a.prefill_chunk, tier.mode(), TG.cls_gu.size());
+    if (split)   // one line per stage, the way upstream logs a layer split (src/program/generate.cpp:2502, 5614)
+        for (size_t si = 0; si < stages.size(); ++si)
+            std::fprintf(stderr, "split: stage %zu: CUDA%d runs layers %lld-%lld on %s, %.2f GiB free, %.2f GiB of expert slots (%lld VRAM / %lld arena / %lld file experts)\n",
+                         si, stages[si]->dev, (long long) stages[si]->lb, (long long) (stages[si]->le - 1),
+                         ggml_backend_name(stages[si]->be), stages[si]->free_gib, stages[si]->slot_gib,
+                         (long long) stages[si]->tier.resident(), (long long) stages[si]->tier.arena_experts(), (long long) stages[si]->tier.file_tier());
 
     // ---- the forward pieces
     std::vector<int> ids1((size_t) top_k);
@@ -557,97 +810,124 @@ int main(int argc, char ** argv) {
     // the host sum; no parts readback / routed upload per layer).  STRATA_DEC_HOSTSUM=1 = the host round trip
     // the routed tensor's device address: re-read after every dense.set_columns (elastic columns reallocate it)
     float * rdev1 = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? dense.routed_dev() : nullptr;
+    stages[0]->rdev = rdev1;
+    // the n-gram window the Engram needs at a stage boundary: tokens fed so far, by position (split only - the
+    // driver feeds positions contiguously, so an append-as-fed ring is exact; ntids is short when pos0 < 3)
+    std::vector<int> fed_ring, win;
+    auto feed_hist = [&](int pos0, const int * toks, int n) {
+        if (stages.size() < 2) return;
+        if ((int) fed_ring.size() < pos0 + n) fed_ring.resize((size_t) (pos0 + n));
+        for (int t = 0; t < n; ++t) fed_ring[(size_t) (pos0 + t)] = toks[t];
+    };
+    auto hist_window = [&](int pos0, int n) {   // positions pos0-3 .. pos0+n-1, whatever has actually been fed
+        win.clear();
+        const int e = std::min((int) fed_ring.size(), pos0 + n);
+        for (int p = std::max(0, pos0 - 3); p < e; ++p) win.push_back(fed_ring[(size_t) p]);
+    };
     double dp[6] = {0, 0, 0, 0, 0, 0};
     long dp_n = 0;
-    auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
-        double ta = dprof ? now_ms() : 0;
+    auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via the last stage's dense
         if (dump_main) {
             dm_tok = tok;
             dm_pos = pos;
             dm_row.assign((size_t) 3 * n_embd, 0.0f);
         }
-        if (!dense.begin(&tok, 1, pos)) { ferr = dense.last_error(); return false; }
-        if (dprof) { const double t = now_ms(); dp[0] += t - ta; ta = t; }
-        int32_t top16[16];
-        bool have_pred = false;
-        for (int l = 0; l < n_layer; ++l) {
-            if (file_pred) {
-                for (int k = 1; k <= kFP; ++k) {
-                    int * const pk = fp_ids.data() + ((size_t) (k - 1) * n_layer + (size_t) (l + k < n_layer ? l + k : 0)) * 16;
-                    if (l + k < n_layer && !dense.predict(l + k, pk, 16)) std::fill(pk, pk + 16, -1);
-                    if (l + k < n_layer)   // file-tier candidates = the reads a speculative fetch would issue
-                        for (int i = 0; i < 16; ++i)
-                            if (pk[i] >= 0 && !tier.resident(l + k, pk[i]) && !tier.in_arena(l + k, pk[i]))
-                                for (int c = 0; c < 3; ++c) fp_cand[k][c] += i < (4 << c);
-                }
+        feed_hist(pos, &tok, 1);
+        for (size_t si = 0; si < stages.size(); ++si) {   // one pass per stage; a single stage = today's loop
+            Ds41Stage & S = *stages[si];
+            double ta = dprof ? now_ms() : 0;
+            if (si == 0) {
+                if (!S.dense.begin(&tok, 1, pos)) { ferr = S.dense.last_error(); return false; }
+            } else {
+                hist_window(pos, 1);   // the Engram hash window: positions pos-3 .. pos
+                if (!S.dense.begin_from_handoff(win.data(), (int) win.size(), 1, pos)) { ferr = S.dense.last_error(); return false; }
+                if (!S.dense.handoff_in(1, err)) { ferr = S.dense.last_error(); return false; }
             }
-            if (advise_ahead > 0 && l + advise_ahead < n_layer) {   // file-tier readahead for layer l+k's predicted experts
-                int ta[16];
-                if (dense.predict(l + advise_ahead, ta, 16)) tier.advise_file(l + advise_ahead, ta, advise_top);
-            }
-            if (mc.pf_b > 0 && !mc.cpu_only) {   // the DMAs run under this layer's attention
-                int t16[16];
-                if (have_pred) {                  // predicted by the previous layer's finish_predict (same state)
-                    tier.prefetch(l, top16, 16);
-                } else if (dense.predict(l, t16, 16)) {
-                    for (int i = 0; i < 16; ++i) top16[i] = t16[i];
-                    tier.prefetch(l, top16, 16);
-                }
-                have_pred = false;
-            }
-            if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
-            const float * fn = nullptr;
-            if (!dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = dense.last_error(); return false; }
-            if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
-            if (file_pred) {
-                for (int j = 0; j < top_k; ++j) {
-                    const int e = ids1[(size_t) j];
-                    if (e < 0 || tier.resident(l, e) || tier.in_arena(l, e)) continue;
-                    ++fp_miss[0];
+            if (dprof) { const double t = now_ms(); dp[0] += t - ta; ta = t; }
+            int32_t top16[16];
+            bool have_pred = false;
+            for (int l = (int) S.lb; l < (int) S.le; ++l) {
+                if (file_pred) {
                     for (int k = 1; k <= kFP; ++k) {
-                        if (l - k < 0) continue;   // nothing predicted this layer k layers ago
-                        const int * pk = fp_ids.data() + ((size_t) (k - 1) * n_layer + (size_t) l) * 16;
-                        ++fp_miss[k];
-                        int at = 16;
-                        for (int i = 0; i < 16; ++i) if (pk[i] == e) { at = i; break; }
-                        if (at < 4) ++fp_hit[k][0];
-                        if (at < 8) ++fp_hit[k][1];
-                        if (at < 16) ++fp_hit[k][2];
+                        int * const pk = fp_ids.data() + ((size_t) (k - 1) * n_layer + (size_t) (l + k < S.le ? l + k : 0)) * 16;
+                        if (l + k < S.le && !S.dense.predict(l + k, pk, 16)) std::fill(pk, pk + 16, -1);   // past the range: skipped, not guessed
+                        if (l + k < S.le)   // file-tier candidates = the reads a speculative fetch would issue
+                            for (int i = 0; i < 16; ++i)
+                                if (pk[i] >= 0 && !stage_at(l + k).tier.resident(l + k, pk[i]) && !stage_at(l + k).tier.in_arena(l + k, pk[i]))
+                                    for (int c = 0; c < 3; ++c) fp_cand[k][c] += i < (4 << c);
+                    }
+                }
+                if (advise_ahead > 0 && l + advise_ahead < (int) S.le) {   // file-tier readahead for layer l+k's predicted experts
+                    int ta[16];
+                    if (S.dense.predict(l + advise_ahead, ta, 16)) S.tier.advise_file(l + advise_ahead, ta, advise_top);
+                }
+                if (mc.pf_b > 0 && !mc.cpu_only) {   // the DMAs run under this layer's attention
+                    int t16[16];
+                    if (have_pred) {                  // predicted by the previous layer's finish_predict (same state)
+                        S.tier.prefetch(l, top16, 16);
+                    } else if (S.dense.predict(l, t16, 16)) {
+                        for (int i = 0; i < 16; ++i) top16[i] = t16[i];
+                        S.tier.prefetch(l, top16, 16);
+                    }
+                    have_pred = false;
+                }
+                if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
+                const float * fn = nullptr;
+                if (!S.dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = S.dense.last_error(); return false; }
+                if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
+                if (file_pred) {
+                    for (int j = 0; j < top_k; ++j) {
+                        const int e = ids1[(size_t) j];
+                        if (e < 0 || S.tier.resident(l, e) || S.tier.in_arena(l, e)) continue;
+                        ++fp_miss[0];
+                        for (int k = 1; k <= kFP; ++k) {
+                            if (l - k < 0) continue;   // nothing predicted this layer k layers ago
+                            const int * pk = fp_ids.data() + ((size_t) (k - 1) * n_layer + (size_t) l) * 16;
+                            ++fp_miss[k];
+                            int at = 16;
+                            for (int i = 0; i < 16; ++i) if (pk[i] == e) { at = i; break; }
+                            if (at < 4) ++fp_hit[k][0];
+                            if (at < 8) ++fp_hit[k][1];
+                            if (at < 16) ++fp_hit[k][2];
+                        }
+                    }
+                }
+                const bool tok = S.rdev ? S.tier.run_to_dev(l, ids1.data(), w1.data(), fn, S.rdev)
+                                       : S.tier.run(l, ids1.data(), w1.data(), fn, routed1.data());
+                if (!tok) { ferr = "tier.run failed"; return false; }
+                if (dprof) { const double t = now_ms(); dp[3] += t - ta; ta = t; }
+                const float * rsum = S.rdev ? nullptr : routed1.data();   // null: already in the routed tensor
+                // a stage's last layer finishes with finish(): finish_predict*'s fused next-layer router lives on
+                // the next stage's card, and finish_predict_ahead would predict layers past the range
+                const int na = std::min(spec_ahead, 8);
+                if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < (int) S.le) {
+                    int t16[16];
+                    if (spec_top > 0 && spec_ahead > 0 && l + 1 + na < (int) S.le) {
+                        int ahead[16 * 8];
+                        if (!S.dense.finish_predict_ahead(l, rsum, l + 1, t16, 16, na, ahead)) { ferr = S.dense.last_error(); return false; }
+                        if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
+                        if (spec_l1) S.tier.spec_read(l + 1, t16, std::min(spec_top, 16));
+                        for (int a = 0; a < na; ++a) S.tier.spec_read(l + 2 + a, ahead + a * 16, std::min(spec_top, 16));
+                        if (dprof) { const double t = now_ms(); dp[5] += t - ta; ta = t; }
+                    } else if (!S.dense.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = S.dense.last_error(); return false; }
+                    for (int i = 0; i < 16; ++i) top16[i] = t16[i];
+                    have_pred = true;
+                } else if (!S.dense.finish(l, rsum)) { ferr = S.dense.last_error(); return false; }
+                if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
+                for (int j = 0; dump_main && j < 3; ++j) {
+                    if (l != dm_layers[j]) continue;
+                    S.dense.read_state(dm_x, dm_pre);   // [n_embd, HC] for the one token
+                    const size_t HC = dm_x.size() / (size_t) n_embd;
+                    for (size_t h = 0; h < HC; ++h)
+                        for (int64_t d = 0; d < n_embd; ++d) dm_row[(size_t) j * n_embd + d] += dm_x[h * n_embd + d] / (float) HC;
+                    if (j == 2) {
+                        std::fwrite(&dm_tok, 4, 1, dump_main);
+                        std::fwrite(&dm_pos, 4, 1, dump_main);
+                        std::fwrite(dm_row.data(), 4, dm_row.size(), dump_main);
                     }
                 }
             }
-            const bool tok = rdev1 ? tier.run_to_dev(l, ids1.data(), w1.data(), fn, rdev1)
-                                   : tier.run(l, ids1.data(), w1.data(), fn, routed1.data());
-            if (!tok) { ferr = "tier.run failed"; return false; }
-            if (dprof) { const double t = now_ms(); dp[3] += t - ta; ta = t; }
-            const float * rsum = rdev1 ? nullptr : routed1.data();   // null: already in the routed tensor
-            if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < n_layer) {
-                int t16[16];
-                if (spec_top > 0 && spec_ahead > 0) {
-                    int ahead[16 * 8];
-                    const int na = std::min(spec_ahead, 8);
-                    if (!dense.finish_predict_ahead(l, rsum, l + 1, t16, 16, na, ahead)) { ferr = dense.last_error(); return false; }
-                    if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
-                    if (spec_l1) tier.spec_read(l + 1, t16, std::min(spec_top, 16));
-                    for (int a = 0; a < na; ++a) tier.spec_read(l + 2 + a, ahead + a * 16, std::min(spec_top, 16));
-                    if (dprof) { const double t = now_ms(); dp[5] += t - ta; ta = t; }
-                } else if (!dense.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = dense.last_error(); return false; }
-                for (int i = 0; i < 16; ++i) top16[i] = t16[i];
-                have_pred = true;
-            } else if (!dense.finish(l, rsum)) { ferr = dense.last_error(); return false; }
-            if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
-            for (int j = 0; dump_main && j < 3; ++j) {
-                if (l != dm_layers[j]) continue;
-                dense.read_state(dm_x, dm_pre);   // [n_embd, HC] for the one token
-                const size_t HC = dm_x.size() / (size_t) n_embd;
-                for (size_t h = 0; h < HC; ++h)
-                    for (int64_t d = 0; d < n_embd; ++d) dm_row[(size_t) j * n_embd + d] += dm_x[h * n_embd + d] / (float) HC;
-                if (j == 2) {
-                    std::fwrite(&dm_tok, 4, 1, dump_main);
-                    std::fwrite(&dm_pos, 4, 1, dump_main);
-                    std::fwrite(dm_row.data(), 4, dm_row.size(), dump_main);
-                }
-            }
+            if (si + 1 < stages.size()) { if (!S.dense.handoff_out(1, err)) { ferr = S.dense.last_error(); return false; } }
         }
         if (dprof && ++dp_n % 64 == 0)
             std::fprintf(stderr, "decode step ms/token: begin %.2f predict %.2f attn_router %.2f tier %.2f finish %.2f spec %.2f (%ld steps)\n",
@@ -662,19 +942,30 @@ int main(int argc, char ** argv) {
     auto pass_m = [&](const int * toks, int m, int pos) -> bool {
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
-        if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
-        for (int l = 0; l < n_layer; ++l) {
-            const float * fn = nullptr;
-            if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
-            for (int t = 0; t < m; ++t) {
-                const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                        fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
-                                      : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                 fn + (size_t) t * n_embd, routed1.data());
-                if (!ok) { ferr = "tier.run failed"; return false; }
-                if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+        feed_hist(pos, toks, m);
+        for (size_t si = 0; si < stages.size(); ++si) {   // one dense pass per stage; a single stage = today
+            Ds41Stage & S = *stages[si];
+            if (si == 0) {
+                if (!S.dense.begin(toks, m, pos)) { ferr = S.dense.last_error(); return false; }
+            } else {
+                hist_window(pos, m);
+                if (!S.dense.begin_from_handoff(win.data(), (int) win.size(), m, pos)) { ferr = S.dense.last_error(); return false; }
+                if (!S.dense.handoff_in(m, err)) { ferr = S.dense.last_error(); return false; }
             }
-            if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
+            for (int l = (int) S.lb; l < (int) S.le; ++l) {
+                const float * fn = nullptr;
+                if (!S.dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = S.dense.last_error(); return false; }
+                for (int t = 0; t < m; ++t) {
+                    const bool ok = S.rdev ? S.tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                            fn + (size_t) t * n_embd, S.rdev + (size_t) t * n_embd)
+                                          : S.tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                       fn + (size_t) t * n_embd, routed1.data());
+                    if (!ok) { ferr = "tier.run failed"; return false; }
+                    if (!S.rdev) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+                }
+                if (!S.dense.finish(l, S.rdev ? nullptr : crouted_m.data())) { ferr = S.dense.last_error(); return false; }
+            }
+            if (si + 1 < stages.size()) { if (!S.dense.handoff_out(m, err)) { ferr = S.dense.last_error(); return false; } }
         }
         return true;
     };
@@ -690,104 +981,115 @@ int main(int argc, char ** argv) {
         // D3 (the batched per-class verify tier) is the default: correct (bias-off verify-vs-prefill gate, near-ties
         // only) and faster (verify 167.6 -> ~100 ms/pass).  STRATA_TIER_BATCH=0 = the per-token run_to_dev path.
         static const bool no_tier_batch = [] { const char* v = std::getenv("STRATA_TIER_BATCH"); return v && v[0] == '0'; }();
-        double tq = now_ms();
-        auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
-        ++pv_n; pv_tok += m;
-        mids.resize((size_t) m * top_k);
-        mw.resize((size_t) m * top_k);
-        vh.assign((size_t) m * 3 * n_embd, 0.0f);
-        if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
         // D3 prefetch (STRATA_D3_PF = slots per layer, default 1, 0 = off): before each layer's attention, predict
         // every pass token's routing (predict_multi), rank the union (score 16 - rank, summed over tokens) and DMA the
         // likely misses into the prefetch slots on the prefetch stream - they land under the attention.  PCIe is the
         // wall (nsys: ~100 expert DMAs per verify pass, 1.4 s of a 4.2 s decode), so a wrong guess costs a full blob:
         // docs prompt, same text: slots 0/1/2/3/6 -> verify 104.4/101.7/104.5/111.1/124.1 ms (precision 40% at 1).
         static const int d3_pf = std::getenv("STRATA_D3_PF") ? std::atoi(std::getenv("STRATA_D3_PF")) : 1;
-        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= Ds41MoeTier::kMaxMulti;
-        for (int l = 0; l < n_layer; ++l) {
-            if (pf_now) {
-                pv_pred.resize((size_t) m * 16);
-                if (dense.predict_multi(l, pv_pred.data())) {
-                    pv_score.clear();
-                    for (int t = 0; t < m; ++t)
-                        for (int i = 0; i < 16; ++i) {
-                            const int e = pv_pred[(size_t) t * 16 + i];
-                            if (e < 0) continue;
-                            auto it = std::find_if(pv_score.begin(), pv_score.end(), [&](const std::pair<int, int> & p) { return p.first == e; });
-                            if (it == pv_score.end()) pv_score.push_back({ e, 16 - i }); else it->second += 16 - i;
-                        }
-                    std::stable_sort(pv_score.begin(), pv_score.end(), [](const std::pair<int, int> & a, const std::pair<int, int> & b) { return a.second > b.second; });
-                    pv_rank.clear();
-                    for (const auto & p : pv_score) pv_rank.push_back(p.first);
-                    tier.prefetch_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_pf);
-                }
-            }
-            // D3 speculative NVMe reads (STRATA_D3_SPEC=n, default 0 = off; STRATA_D3_SPEC_AHEAD=k, default 2): the
-            // pass's routing for layer l+k predicted from the state entering l (predict_multi, bias included), its
-            // union ranked as above, and the NVMe-tier experts among the top n read into the stash by background
-            // readers while layers l..l+k-1 run - the verify pass otherwise waits on them (nsys x0.5: pthread_join
-            // 7.9 ms/token on the decode thread).  A wrong guess costs SSD bandwidth only.
-            static const int d3_spec = std::getenv("STRATA_D3_SPEC") ? std::atoi(std::getenv("STRATA_D3_SPEC")) : 0;
-            static const int d3_spec_ahead = std::getenv("STRATA_D3_SPEC_AHEAD") ? std::atoi(std::getenv("STRATA_D3_SPEC_AHEAD")) : 2;
-            if (rdev1 && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < n_layer) {
-                pv_pred.resize((size_t) m * 16);
-                if (dense.predict_multi(l + d3_spec_ahead, pv_pred.data())) {
-                    pv_score.clear();
-                    for (int t = 0; t < m; ++t)
-                        for (int i = 0; i < 16; ++i) {
-                            const int e = pv_pred[(size_t) t * 16 + i];
-                            if (e < 0) continue;
-                            auto it = std::find_if(pv_score.begin(), pv_score.end(), [&](const std::pair<int, int> & q) { return q.first == e; });
-                            if (it == pv_score.end()) pv_score.push_back({ e, 16 - i }); else it->second += 16 - i;
-                        }
-                    std::stable_sort(pv_score.begin(), pv_score.end(), [](const std::pair<int, int> & a, const std::pair<int, int> & b) { return a.second > b.second; });
-                    pv_rank.clear();
-                    for (const auto & q : pv_score) pv_rank.push_back(q.first);
-                    tier.spec_read(l + d3_spec_ahead, pv_rank.data(), std::min(d3_spec, (int) pv_rank.size()), true);
-                }
-            }
-            const float * fn = nullptr;
-            if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
-            lap(0);
-            if (rdev1 && !no_tier_batch) {
-                // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
-                // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (8: a depth-4 pass is one call).
-                constexpr int kMM = Ds41MoeTier::kMaxMulti;
-                for (int off = 0; off < m; off += kMM) {
-                    const int chunk = std::min(kMM, m - off);
-                    if (!tier.run_multi_to_dev(l, chunk, mids.data() + (size_t) off * top_k, mw.data() + (size_t) off * top_k,
-                                               fn + (size_t) off * n_embd, rdev1 + (size_t) off * n_embd)) {
-                        ferr = "tier.run_multi_to_dev failed"; return false;
-                    }
-                }
+        // D3 speculative NVMe reads (STRATA_D3_SPEC=n, default 0 = off; STRATA_D3_SPEC_AHEAD=k, default 2): the
+        // pass's routing for layer l+k predicted from the state entering l (predict_multi, bias included), its
+        // union ranked as above, and the NVMe-tier experts among the top n read into the stash by background
+        // readers while layers l..l+k-1 run - the verify pass otherwise waits on them (nsys x0.5: pthread_join
+        // 7.9 ms/token on the decode thread).  A wrong guess costs SSD bandwidth only.
+        static const int d3_spec = std::getenv("STRATA_D3_SPEC") ? std::atoi(std::getenv("STRATA_D3_SPEC")) : 0;
+        static const int d3_spec_ahead = std::getenv("STRATA_D3_SPEC_AHEAD") ? std::atoi(std::getenv("STRATA_D3_SPEC_AHEAD")) : 2;
+        double tq = now_ms();
+        auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
+        ++pv_n; pv_tok += m;
+        mids.resize((size_t) m * top_k);
+        mw.resize((size_t) m * top_k);
+        vh.assign((size_t) m * 3 * n_embd, 0.0f);
+        feed_hist(pos, toks, m);
+        for (size_t si = 0; si < stages.size(); ++si) {   // one dense pass per stage; a single stage = today
+            Ds41Stage & S = *stages[si];
+            if (si == 0) {
+                if (!S.dense.begin(toks, m, pos)) { ferr = S.dense.last_error(); return false; }
             } else {
-                for (int t = 0; t < m; ++t) {
-                    const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                            fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
-                                          : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                     fn + (size_t) t * n_embd, routed1.data());
-                    if (!ok) { ferr = "tier.run failed"; return false; }
-                    if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+                hist_window(pos, m);
+                if (!S.dense.begin_from_handoff(win.data(), (int) win.size(), m, pos)) { ferr = S.dense.last_error(); return false; }
+                if (!S.dense.handoff_in(m, err)) { ferr = S.dense.last_error(); return false; }
+            }
+            const bool pf_now = S.rdev && !no_tier_batch && d3_pf > 0 && m <= Ds41MoeTier::kMaxMulti;
+            for (int l = (int) S.lb; l < (int) S.le; ++l) {
+                if (pf_now) {
+                    pv_pred.resize((size_t) m * 16);
+                    if (S.dense.predict_multi(l, pv_pred.data())) {
+                        pv_score.clear();
+                        for (int t = 0; t < m; ++t)
+                            for (int i = 0; i < 16; ++i) {
+                                const int e = pv_pred[(size_t) t * 16 + i];
+                                if (e < 0) continue;
+                                auto it = std::find_if(pv_score.begin(), pv_score.end(), [&](const std::pair<int, int> & p) { return p.first == e; });
+                                if (it == pv_score.end()) pv_score.push_back({ e, 16 - i }); else it->second += 16 - i;
+                            }
+                        std::stable_sort(pv_score.begin(), pv_score.end(), [](const std::pair<int, int> & a, const std::pair<int, int> & b) { return a.second > b.second; });
+                        pv_rank.clear();
+                        for (const auto & p : pv_score) pv_rank.push_back(p.first);
+                        S.tier.prefetch_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_pf);
+                    }
+                }
+                if (S.rdev && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < (int) S.le) {
+                    pv_pred.resize((size_t) m * 16);
+                    if (S.dense.predict_multi(l + d3_spec_ahead, pv_pred.data())) {   // past the range: skipped, not guessed
+                        pv_score.clear();
+                        for (int t = 0; t < m; ++t)
+                            for (int i = 0; i < 16; ++i) {
+                                const int e = pv_pred[(size_t) t * 16 + i];
+                                if (e < 0) continue;
+                                auto it = std::find_if(pv_score.begin(), pv_score.end(), [&](const std::pair<int, int> & q) { return q.first == e; });
+                                if (it == pv_score.end()) pv_score.push_back({ e, 16 - i }); else it->second += 16 - i;
+                            }
+                        std::stable_sort(pv_score.begin(), pv_score.end(), [](const std::pair<int, int> & a, const std::pair<int, int> & b) { return a.second > b.second; });
+                        pv_rank.clear();
+                        for (const auto & q : pv_score) pv_rank.push_back(q.first);
+                        S.tier.spec_read(l + d3_spec_ahead, pv_rank.data(), std::min(d3_spec, (int) pv_rank.size()), true);
+                    }
+                }
+                const float * fn = nullptr;
+                if (!S.dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = S.dense.last_error(); return false; }
+                lap(0);
+                if (S.rdev && !no_tier_batch) {
+                    // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
+                    // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (8: a depth-4 pass is one call).
+                    constexpr int kMM = Ds41MoeTier::kMaxMulti;
+                    for (int off = 0; off < m; off += kMM) {
+                        const int chunk = std::min(kMM, m - off);
+                        if (!S.tier.run_multi_to_dev(l, chunk, mids.data() + (size_t) off * top_k, mw.data() + (size_t) off * top_k,
+                                                     fn + (size_t) off * n_embd, S.rdev + (size_t) off * n_embd)) {
+                            ferr = "tier.run_multi_to_dev failed"; return false;
+                        }
+                    }
+                } else {
+                    for (int t = 0; t < m; ++t) {
+                        const bool ok = S.rdev ? S.tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                                fn + (size_t) t * n_embd, S.rdev + (size_t) t * n_embd)
+                                              : S.tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                          fn + (size_t) t * n_embd, routed1.data());
+                        if (!ok) { ferr = "tier.run failed"; return false; }
+                        if (!S.rdev) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+                    }
+                }
+                lap(1);
+                if (!S.dense.finish(l, S.rdev ? nullptr : crouted_m.data())) { ferr = S.dense.last_error(); return false; }
+                lap(0);
+                for (int j = 0; j < 3; ++j) {
+                    if (l != dm_layers[j]) continue;
+                    if (!S.dense.read_state(vx, vpre)) { ferr = S.dense.last_error(); return false; }
+                    const size_t HC = vx.size() / ((size_t) m * n_embd);
+                    for (int t = 0; t < m; ++t)
+                        for (size_t h = 0; h < HC; ++h) {
+                            const float * xs = vx.data() + ((size_t) t * HC + h) * n_embd;
+                            float * dst = vh.data() + (size_t) t * 3 * n_embd + (size_t) j * n_embd;
+                            for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
+                        }
+                    lap(2);
                 }
             }
-            lap(1);
-            if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
-            lap(0);
-            for (int j = 0; j < 3; ++j) {
-                if (l != dm_layers[j]) continue;
-                if (!dense.read_state(vx, vpre)) { ferr = dense.last_error(); return false; }
-                const size_t HC = vx.size() / ((size_t) m * n_embd);
-                for (int t = 0; t < m; ++t)
-                    for (size_t h = 0; h < HC; ++h) {
-                        const float * xs = vx.data() + ((size_t) t * HC + h) * n_embd;
-                        float * dst = vh.data() + (size_t) t * 3 * n_embd + (size_t) j * n_embd;
-                        for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
-                    }
-                lap(2);
-            }
+            if (si + 1 < stages.size()) { if (!S.dense.handoff_out(m, err)) { ferr = S.dense.last_error(); return false; } }
         }
         vlog.resize((size_t) m * nv);
-        if (!dense.logits(0, m, vlog.data())) { ferr = dense.last_error(); return false; }
+        if (!stages.back()->dense.logits(0, m, vlog.data())) { ferr = stages.back()->dense.last_error(); return false; }   // the head is the last stage's
         lap(3);
         return true;
     };
@@ -823,7 +1125,7 @@ int main(int argc, char ** argv) {
     std::unique_ptr<Ds41DSpark> dsp;
 #endif
     auto open_cache = [&]() -> bool {
-        dense.release_pass();
+        all_release_pass();
 #if defined(DS41_HAVE_DSPARK)
         if (dsp_path && !dsp) {
             Ds41DSparkConfig sc;
@@ -831,7 +1133,8 @@ int main(int argc, char ** argv) {
             sc.sidecar = dsp_path;
             sc.main_gguf = a.model;
             sc.max_append = 16;
-            if (!std::getenv("STRATA_DSPARK_OWN_HEAD")) sc.shared_head = dense.weight("output.weight");   // -0.7 GB
+            // DSpark is refused under --split (flag validation): single stage, and the head is that stage's
+            if (!std::getenv("STRATA_DSPARK_OWN_HEAD")) sc.shared_head = stages.back()->dense.weight("output.weight");   // -0.7 GB
             dsp = std::make_unique<Ds41DSpark>();
             const double ti = now_ms();
             if (!dsp->init(sc, err)) { err = "DSpark init: " + err; return false; }
@@ -839,10 +1142,17 @@ int main(int argc, char ** argv) {
                          (now_ms() - ti) / 1000.0);
         }
 #endif
-        size_t fr = 0, tot = 0;
-        ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
-        seed_free = fr / 1073741824.0;
-        seed_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+        // per stage: its own free VRAM, its own slot budget; seed_free / seed_gib report the tightest stage (the logs)
+        double worst_free = 1e30;
+        for (auto & S : stages) {
+            size_t fr = 0, tot = 0;
+            ggml_backend_dev_memory(S->bdev, &fr, &tot);
+            S->free_gib = (double) fr / 1073741824.0;
+            S->slot_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+            worst_free = std::min(worst_free, S->free_gib);
+        }
+        seed_free = worst_free;
+        seed_gib = std::max(0.0, worst_free - a.vram_margin_gib);
         // A slot budget of 0 is the tier's "NO LIMIT" (--slots given: the ranked head, up to `slots` experts).  The
         // AUTO path passed it too whenever the card had no room (`free <= margin` clamps seed_gib to 0) - and "no
         // limit" there asked for the WHOLE model's experts: s13 run8 hit exactly that (142.38 GiB requested, 0.53
@@ -850,19 +1160,26 @@ int main(int argc, char ** argv) {
         // the arena + file tier serve every miss: a slower decode, never a failed request.
         const double min_gib = 1.0;   // below this the admission traffic is not worth the slots
         const bool explicit_slots = a.slots > 0;
-        const bool cache_room = explicit_slots || seed_gib >= min_gib;
-        tier.set_cache_enabled(cache_room);
-        tier.set_slot_gib(explicit_slots ? 0.0 : seed_gib);
+        bool cache_room = false;
+        for (auto & S : stages) {   // each stage sizes its cache from its own card's room, seeds its own layer slice
+            const bool room = explicit_slots || S->slot_gib >= min_gib;
+            S->tier.set_cache_enabled(room);
+            S->tier.set_slot_gib(explicit_slots ? 0.0 : S->slot_gib);
+            cache_room = cache_room || room;
+        }
         if (!cache_room) std::fprintf(stderr, "serve: VRAM %.2f GiB free (margin %.2f) - no room for the expert cache, "
                                              "the arena + file tier serve the decode\n", seed_free, a.vram_margin_gib);
         const double ts = now_ms();
-        if (!tier.seed_from_ranked(ranked, err)) {
+        bool seeded = true;
+        for (auto & S : stages)
+            if (!S->tier.seed_from_ranked(ranked_for(*S), err)) { seeded = false; break; }
+        if (!seeded) {
             // the cache's own allocation is what fails on a busy card (the arena is host RAM and is built first):
             // one more try with the cache off, so the request still runs
             if (cache_room) {
                 std::fprintf(stderr, "serve: cache seed failed (%s) - seeding again with the VRAM cache off\n", err.c_str());
-                tier.set_cache_enabled(false);
-                if (!tier.seed_from_ranked(ranked, err)) return false;
+                for (auto & S : stages) S->tier.set_cache_enabled(false);
+                for (auto & S : stages) if (!S->tier.seed_from_ranked(ranked_for(*S), err)) return false;
             } else return false;
         }
         seed_s = (now_ms() - ts) / 1000.0;
@@ -892,7 +1209,8 @@ int main(int argc, char ** argv) {
         const int t0 = n - tail_keep, lo = std::max(row0, t0), hi = row0 + nrows;
         if (lo >= hi) return true;
         if (tail_logits.size() != (size_t) tail_keep * (size_t) nv) tail_logits.assign((size_t) tail_keep * (size_t) nv, 0.0f);
-        if (!dense.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) { ferr = dense.last_error(); return false; }
+        // the head lives on the last stage; the layer-major path (single stage) reads the same object
+        if (!stages.back()->dense.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) { ferr = stages.back()->dense.last_error(); return false; }
         return true;
     };
     int bcap_n = 0, bcap_got = 0;  // serve DSpark seed captured from a layer-major batch (see the layer loop below)
@@ -900,12 +1218,13 @@ int main(int argc, char ** argv) {
     // the layer-major batch width for THIS turn: PB, clamped per request by the VRAM actually free (the --serve loop
     // sets it; a one-shot run keeps PB)
     int pb_cap = PB;
+    int prefix_capture = -1;   // serve only: rings immediately before the prompt's final token
     // STRATA_VRAM_TRACE=1: every allocation-relevant step prints the free VRAM (debugging a shared card)
     const bool vram_trace = std::getenv("STRATA_VRAM_TRACE") != nullptr;
-    auto vram_log = [&](const char * where, int a) {
+    auto vram_log = [&](const char * where, int a, size_t si = 0) {   // the stage whose card to probe
         if (!vram_trace) return;
         size_t tf = 0, tt = 0;
-        ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+        ggml_backend_dev_memory(stages[si]->bdev, &tf, &tt);
         std::fprintf(stderr, "vram trace: %s %d free %.2f GiB\n", where, a, tf / 1073741824.0);
     };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
@@ -922,7 +1241,7 @@ int main(int argc, char ** argv) {
                 // failed" on a 21K prompt with Whisper's 2.5 GB resident).
                 for (;;) {
                     if (B > dense.columns()) {
-                        if (dense.set_columns(B)) { if (rdev1) rdev1 = dense.routed_dev(); }
+                        if (dense.set_columns(B)) { if (rdev1) rdev1 = dense.routed_dev(); stages[0]->rdev = rdev1; }
                         else if (B > SB) {
                             std::fprintf(stderr, "ds41_generate: %d state columns did not fit (%s) - retrying at %d\n",
                                          B, dense.last_error().c_str(), std::max(SB, B / 2));
@@ -964,9 +1283,13 @@ int main(int argc, char ** argv) {
                             if (!dense.attn_router_span_kv(l, s, sn)) { ferr = dense.last_error(); return false; }
                         }
                     }
-                    for (int s = d0; s < B; s += SB) {   // sub-batches in order: the layer's KV state advances as today
-                        const int sn = std::min(SB, B - s);
+                    for (int s = d0; s < B; ) {   // sub-batches in order; capture BEFORE the final token overwrites its ring slot
+                        int sn = std::min(SB, B - s);
+                        const int p = pos0 + c0 + s;
+                        if (prefix_capture > p && prefix_capture < p + sn) sn = prefix_capture - p;
+                        if (prefix_capture == p && !dense.snapshot_prefix(p, l)) { ferr = "prefix snapshot failed"; return false; }
                         if (!dense.attn_router_span(l, s, sn)) { ferr = dense.last_error(); return false; }
+                        s += sn;
                     }
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
@@ -1027,44 +1350,58 @@ int main(int argc, char ** argv) {
                 fd_logits += now_ms() - tl;
                 c0 += B;
             } else {
-                // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
-                const int m = std::min(NP, n - c0);
+                // ---- the sequential chunk path: one pass of up to NP tokens through every layer, per stage (the
+                // layer-major branch above is refused under --split, so it stays a single-stage loop)
+                int m = std::min(NP, n - c0);
+                if (prefix_capture > pos0 + c0 && prefix_capture < pos0 + c0 + m) m = prefix_capture - pos0 - c0;
+                if (prefix_capture == pos0 + c0 && !all_snapshot_prefix(prefix_capture)) { ferr = "prefix snapshot failed"; return false; }
                 double t0 = now_ms();
-                if (!dense.begin(ids + c0, m, pos0 + c0)) { ferr = dense.last_error(); return false; }
-                for (int l = 0; l < n_layer; ++l) {
-                    const float * fn = nullptr;
-                    if (!dense.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = dense.last_error(); return false; }
-                    if (dump_dir) {
-                        char nb[64];
-                        std::snprintf(nb, sizeof(nb), "L%02d_fn.f32", l);
-                        dumpf(nb, fn, (size_t) m * (size_t) n_embd * 4);
-                        std::vector<int> sel; std::vector<float> smask; int K = 0;
-                        if (dense.read_sel(l, sel, smask, &K) && K > 0 && !sel.empty()) {
-                            std::snprintf(nb, sizeof(nb), "L%02d_sel.i32", l);
-                            dumpf(nb, sel.data(), sel.size() * 4);
+                feed_hist(pos0 + c0, ids + c0, m);
+                for (size_t si = 0; si < stages.size(); ++si) {   // a single stage = today's pass, same calls
+                    Ds41Stage & S = *stages[si];
+                    if (si == 0) {
+                        if (!S.dense.begin(ids + c0, m, pos0 + c0)) { ferr = S.dense.last_error(); return false; }
+                    } else {
+                        hist_window(pos0 + c0, m);
+                        if (!S.dense.begin_from_handoff(win.data(), (int) win.size(), m, pos0 + c0)) { ferr = S.dense.last_error(); return false; }
+                        if (!S.dense.handoff_in(m, err)) { ferr = S.dense.last_error(); return false; }
+                    }
+                    for (int l = (int) S.lb; l < (int) S.le; ++l) {
+                        const float * fn = nullptr;
+                        if (!S.dense.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = S.dense.last_error(); return false; }
+                        if (dump_dir) {
+                            char nb[64];
+                            std::snprintf(nb, sizeof(nb), "L%02d_fn.f32", l);
+                            dumpf(nb, fn, (size_t) m * (size_t) n_embd * 4);
+                            std::vector<int> sel; std::vector<float> smask; int K = 0;
+                            if (S.dense.read_sel(l, sel, smask, &K) && K > 0 && !sel.empty()) {
+                                std::snprintf(nb, sizeof(nb), "L%02d_sel.i32", l);
+                                dumpf(nb, sel.data(), sel.size() * 4);
+                            }
                         }
+                        const double t1 = now_ms();
+                        fd_dense += t1 - t0;
+                        const bool ok = m == 1 ? S.tier.run(l, cids.data(), cw.data(), fn, crouted.data())
+                                               : S.tier.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
+                        if (!ok) { ferr = "tier run refused"; return false; }
+                        if (dump_dir) {
+                            char nb[64];
+                            std::snprintf(nb, sizeof(nb), "L%02d_routed.f32", l);
+                            dumpf(nb, crouted.data(), (size_t) m * (size_t) n_embd * 4);
+                        }
+                        t0 = now_ms();
+                        fd_tier += t0 - t1;
+                        if (!S.dense.finish(l, crouted.data())) { ferr = S.dense.last_error(); return false; }
                     }
-                    const double t1 = now_ms();
-                    fd_dense += t1 - t0;
-                    const bool ok = m == 1 ? tier.run(l, cids.data(), cw.data(), fn, crouted.data())
-                                           : tier.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
-                    if (!ok) { ferr = "tier run refused"; return false; }
-                    if (dump_dir) {
-                        char nb[64];
-                        std::snprintf(nb, sizeof(nb), "L%02d_routed.f32", l);
-                        dumpf(nb, crouted.data(), (size_t) m * (size_t) n_embd * 4);
-                    }
-                    t0 = now_ms();
-                    fd_tier += t0 - t1;
-                    if (!dense.finish(l, crouted.data())) { ferr = dense.last_error(); return false; }
+                    if (si + 1 < stages.size()) { if (!S.dense.handoff_out(m, err)) { ferr = S.dense.last_error(); return false; } }
                 }
                 fd_dense += now_ms() - t0;
                 const double tl = now_ms();
                 if (all_logits) {
                     all_logits->resize((size_t) (c0 + m) * (size_t) nv);
-                    if (!dense.logits(0, m, all_logits->data() + (size_t) c0 * nv)) { ferr = dense.last_error(); return false; }
+                    if (!stages.back()->dense.logits(0, m, all_logits->data() + (size_t) c0 * nv)) { ferr = stages.back()->dense.last_error(); return false; }
                     if (c0 + m == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
-                } else if (c0 + m == n && !dense.logits(m - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                } else if (c0 + m == n && !stages.back()->dense.logits(m - 1, 1, last_logits.data())) { ferr = stages.back()->dense.last_error(); return false; }
                 if (!capture_tail(n, c0, m, 0)) return false;
                 fd_logits += now_ms() - tl;
                 c0 += m;
@@ -1074,8 +1411,9 @@ int main(int argc, char ** argv) {
         if (dc.elastic_cols) {   // back to S columns
             if (!dense.set_columns(0)) { ferr = dense.last_error(); return false; }
             if (rdev1) rdev1 = dense.routed_dev();
+            stages[0]->rdev = rdev1;
         }
-        tier.release_chunk();
+        each_tier([](Ds41MoeTier & T) { T.release_chunk(); });   // every stage's chunk buffers
         return true;
     };
 
@@ -1114,6 +1452,7 @@ int main(int argc, char ** argv) {
         const int ctxv = (int) ctx;
         std::vector<int> hist;
         int snap_len = -1;
+        bool live_reusable = true;   // speculative passes may leave rejected rows in the live rings
         std::vector<float> snap_logits;   // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
         // s6: DSpark's seed rows (main_hidden) of the snapshot's prompt tail - a repeated prompt (regenerate / a client
         // retry) feeds no new tokens, so without them DSpark had nothing to seed from and the whole answer decoded
@@ -1134,6 +1473,7 @@ int main(int argc, char ** argv) {
         std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
         std::vector<float> park_logits;
         int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
+        int park_prefix_len = -1;
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
 #if defined(DS41_HAVE_DSPARK)
         // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
@@ -1151,8 +1491,8 @@ int main(int argc, char ** argv) {
         const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 768;
         // STRATA_SERVE_PASS_BIAS=0: those passes route exactly (the decode biases only while decoding)
         const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
-        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
-                    (long long) tier.arena_experts());
+        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) sum_resident(),
+                    (long long) sum_arena());
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
@@ -1161,7 +1501,7 @@ int main(int argc, char ** argv) {
         while (next_line(line)) {
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
-            dense.clear_vision();
+            all_clear_vision();
             if (previous_vision) {
                 hist.clear();
                 snap_len = -1;
@@ -1213,46 +1553,38 @@ int main(int argc, char ** argv) {
                 if (vis_rows.empty()) { std::printf("ERR GENI prompt has no image tokens\n"); std::fflush(stdout); continue; }
                 // an image prompt prefills fresh: every image span is the same run of image_token, so a token-only reuse
                 // test would "continue" a different image (same ids, different embeddings).  Empty hist / no snapshot / no park.
-                dense.drop_park();
+                all_drop_park();
                 park_hist.clear();
                 hist.clear();
                 snap_len = -1;
                 dense.set_vision(vis_rows.data(), vis_pos.data(), (int) vis_pos.size());
                 previous_vision = true;
             } else {
-                dense.clear_vision();
+                all_clear_vision();
             }
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
             bool unparked = false;
-            int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
+            int reuse_override = -1;   // a parked checkpoint's exact captured position
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
-            if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
+            if (stages[0]->dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
                 size_t lp = 0;
                 while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
                 lp_show = lp;
-                // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues MOST of the parked conversation is
-                // worth restoring, not only one that continues ALL of it.  A chat template that re-renders its tail -
-                // or an EMPTY assistant turn, as the s13 harness produces - leaves lp just under park_hist.size(), and
-                // requiring an exact prefix threw away a 21,349-token cache over a 27-token difference: run8/run15 both
-                // logged "reuse lcp=27 hist=0 snap=-1 prompt=23531 -> reused=0" and re-read the whole prompt.
-                // Positional caches make a partial resume safe: unpark() restores positions [0, park_size) and the
-                // forward pass then re-feeds from lp, overwriting the stale tail (that is the documented fix: "resume
-                // at the longest common prefix even when it is below the snapshot").
-                static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
-                const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) park_hist.size() * 3 / 4);
-                if (park_partial && lp < park_hist.size() && lp >= lp_min && lp > lcp && dense.unpark()) {
-                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there)\n",
-                                 park_hist.size(), lp);
-                    hist = park_hist;
-                    snap_len = -1;        // the tail under the park's end is re-fed, so no snapshot survives this
-                    reuse_override = (int) lp;
-                    lcp = lp;
+                // A ring snapshot can only resume at its captured position, never at an arbitrary LCP.
+                // The pre-tail checkpoint handles the generation marker rewritten by drop_thinking.
+                if (park_prefix_len > 0 && lp >= (size_t) park_prefix_len && lp < park_hist.size()
+                    && (size_t) park_prefix_len > lcp && ids.size() > (size_t) park_prefix_len
+                    && all_unpark() && all_restore_prefix()) {
+                    hist.assign(park_hist.begin(), park_hist.begin() + park_prefix_len);
+                    snap_len = -1;
+                    reuse_override = park_prefix_len;
+                    lcp = (size_t) park_prefix_len;
                     unparked = true;
 #if defined(DS41_HAVE_DSPARK)
-                    dsp_next = -1;        // DSpark's window holds the side request's states
+                    dsp_next = -1;
 #endif
-                } else if (lp == park_hist.size() && lp > lcp && dense.unpark()) {
+                } else if (lp == park_hist.size() && lp > lcp && all_unpark()) {
                     std::fprintf(stderr, "serve: unparked the %zu-token conversation\n", park_hist.size());
                     hist = park_hist;
                     snap_len = (int) park_hist.size();
@@ -1264,39 +1596,55 @@ int main(int argc, char ** argv) {
                     dsp_next = -1;     // DSpark's window holds the side request's states
 #endif
                 } else if ((int64_t) ids.size() + std::max(0, max_new) > park_rows) {
-                    dense.drop_park();   // this request writes past the saved rows
+                    all_drop_park();   // this request writes past the saved rows
                     std::fprintf(stderr, "serve: park dropped (request reaches past %lld positions)\n", (long long) park_rows);
                 }
             }
             int reused = 0;
             bool regen = false;   // the snapshot's own prompt again: nothing new to feed
-            if (reuse_override >= 0) reused = reuse_override;   // a partial unpark: positions [0, lp) are the parked one's
-            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
-            else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
+            if (reuse_override >= 0) reused = reuse_override;
+            else if (!unparked && live_reusable && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
+            else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && all_restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
                 last_logits = snap_logits;
                 regen = true;
-            } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
+            } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && all_restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            } else if (!unparked && snap_len > 1 && stages[0]->dense.prefix_snapshot_pos() == snap_len - 1
+                       && lcp >= (size_t) (snap_len - 1) && ids.size() > (size_t) (snap_len - 1) && all_restore_prefix()) {
+                reused = snap_len - 1;
+                hist.resize((size_t) reused);
+                snap_len = -1;   // refeeding from here replaces the old final token and its snapshot
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
                 const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
-                if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
-                    && dense.park(rows)) {
+                if (park_on && !stages[0]->dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
+                    && all_park(rows)) {
                     park_hist.assign(hist.begin(), hist.begin() + snap_len);
                     park_logits = snap_logits;
                     park_rows = rows;
+                    park_prefix_len = stages[0]->dense.prefix_snapshot_pos();
                     std::fprintf(stderr, "serve: parked the %d-token conversation (%lld positions saved)\n", snap_len, (long long) rows);
                 }
                 hist.clear();
                 snap_len = -1;
             }
+            live_reusable = true;
             std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
                          park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
+            if (unparked)
+                for (auto & S : stages) S->dense.restore_token_history(hist.data(), (int) hist.size());
+            if (stages.size() > 1) {   // the Engram window ring must hold THIS conversation's tokens: park /
+                // unpark / restore reuse positions, and the ring alone would still carry the side request's
+                if (fed_ring.size() < hist.size()) fed_ring.resize(hist.size());
+                for (size_t p = 0; p < hist.size(); ++p) fed_ring[p] = hist[p];
+            }
             if (reused > 0) { std::printf("RESUME %d\n", reused); std::fflush(stdout); }
             const int total = (int) ids.size();
+            prefix_capture = total > reused && total > 1 && !is_vision ? total - 1 : -1;
+            if (total > reused) all_snapshot_prefix(-1);
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
             // the prompt's routing (no decode bias).  A short one (<= step_max new tokens: a chat / agent turn's tool
             // result) runs on the decode side instead - small dense passes, the cache and the decode biases: the
@@ -1357,18 +1705,26 @@ int main(int argc, char ** argv) {
                 if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
                     const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
                                         a.vram_margin_gib * 1073741824.0;
-                    std::string kerr;
-                    const int64_t g = tier.shrink_cache_for((int64_t) need, kerr);
-                    if (g >= 0) {
+                    // every stage shrinks its own card's cache by the same budget; kept only if all of them can
+                    int64_t gmin = INT64_MAX;
+                    bool all_shrunk = true;
+                    std::string kerr_all;
+                    for (auto & P : stages) {
+                        std::string kerr;
+                        const int64_t g = P->tier.shrink_cache_for((int64_t) need, kerr);
+                        if (g < 0) { all_shrunk = false; if (!kerr.empty()) kerr_all = kerr; }
+                        else gmin = std::min(gmin, g);
+                    }
+                    if (all_shrunk) {
                         kept = true;
                         std::fprintf(stderr, "serve: cache kept for a %d-token batch (%lld tail slots out, %lld experts stay)\n",
-                                     dh, (long long) g, (long long) tier.resident());
-                    } else if (!kerr.empty()) {
-                        std::fprintf(stderr, "serve: keep-cache: %s - releasing the cache\n", kerr.c_str());
+                                     dh, (long long) gmin, (long long) sum_resident());
+                    } else if (!kerr_all.empty()) {
+                        std::fprintf(stderr, "serve: keep-cache: %s - releasing the cache\n", kerr_all.c_str());
                     }
                 }
                 if (!kept) {
-                    tier.release_cache();
+                    each_tier([](Ds41MoeTier & T) { T.release_cache(); });
                     cache_open = false;
 #if defined(DS41_HAVE_DSPARK)
                     // STRATA_SERVE_DSPARK_EVICT=N (s6, opt-in until measured; 0 = off): a batch of >= N new tokens also
@@ -1385,8 +1741,8 @@ int main(int argc, char ** argv) {
                 bias_now = a.bias_prompt > 0;
                 apply_bias();
             }
-            tier.rebalance_begin_prompt();
-            tier.reset_stats();
+            each_tier([](Ds41MoeTier & T) { T.rebalance_begin_prompt(); });
+            each_tier([](Ds41MoeTier & T) { T.reset_stats(); });
             if (const char* rl = std::getenv("STRATA_ROUTE_LOG")) {   // a turn marker for the route log (see ds41_moe.cpp)
                 if (FILE* f = std::fopen(rl, "a")) { std::fprintf(f, "# turn %d new %d %s\n", n_req, dh, by_step ? "passes" : "batch"); std::fclose(f); }
             }
@@ -1399,7 +1755,10 @@ int main(int argc, char ** argv) {
             auto feed_steps = [&]() -> bool {   // the short-turn path: passes of up to pass_max tokens (a lone token: a step)
                 int last_rows = 1;
                 for (int i = 0; i < dh; ) {
-                    const int m = std::min(pass_max, dh - i);
+                    int m = std::min(pass_max, dh - i);
+                    const int p = reused + i;
+                    if (prefix_capture > p && prefix_capture < p + m) m = prefix_capture - p;
+                    if (prefix_capture == p && !all_snapshot_prefix(p)) { ferr = "prefix snapshot failed"; return false; }
                     if (!(m == 1 ? step(ids[(size_t) (reused + i)], reused + i) : pass_m(ids.data() + reused + i, m, reused + i))) return false;
                     if (!capture_tail(delta, i, m, 0)) return false;   // this pass's rows, before the next pass replaces them
                     const int before = i;
@@ -1407,7 +1766,7 @@ int main(int argc, char ** argv) {
                     last_rows = m;
                     if (i / 64 != before / 64 && i < dh) pp(i);
                 }
-                if (!dense.logits(last_rows - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                if (!stages.back()->dense.logits(last_rows - 1, 1, last_logits.data())) { ferr = stages.back()->dense.last_error(); return false; }
                 pp(dh);
                 return true;
             };
@@ -1451,10 +1810,13 @@ int main(int argc, char ** argv) {
             bcap_n = 0;
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
                 std::string kerr;
-                dense.release_pass();   // the batch's pass buffers first (open_cache does the same before a seed)
-                if (tier.regrow_cache(kerr) < 0) {
+                all_release_pass();   // the batch's pass buffers first (open_cache does the same before a seed)
+                // every stage regrows its own tail; any failure re-seeds the whole thing
+                int64_t rg = 0;
+                for (auto & P : stages) rg = std::min(rg, P->tier.regrow_cache(kerr));
+                if (rg < 0) {
                     std::fprintf(stderr, "serve: keep-cache regrow: %s - re-seeding\n", kerr.c_str());
-                    tier.release_cache();
+                    each_tier([](Ds41MoeTier & T) { T.release_cache(); });
                     cache_open = false;
                 } else {
                     bias_now = true;
@@ -1496,8 +1858,10 @@ int main(int argc, char ** argv) {
                     }
                     if (bcap_got < 1) { ferr = "DSpark batch seed captured nothing"; ok = false; }
                 }
-                for (int i0 = total - sp_tail; ok && bcap == 0 && i0 < total; i0 += 16) {
-                    const int m = std::min(16, total - i0);
+                for (int i0 = total - sp_tail; ok && bcap == 0 && i0 < total; ) {
+                    int m = std::min(16, total - i0);
+                    if (prefix_capture > i0 && prefix_capture < i0 + m) m = prefix_capture - i0;
+                    if (prefix_capture == i0 && !all_snapshot_prefix(i0)) { ferr = "prefix snapshot failed"; ok = false; break; }
                     if (!pass_v(ids.data() + i0, m, i0)) { ok = false; break; }
                     spos.resize((size_t) m);
                     for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
@@ -1513,6 +1877,7 @@ int main(int argc, char ** argv) {
                     if (!dsp->step(vh.data(), spos.data(), m, last ? sp_t : -1, last ? sp_ids : sp_tmp, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
                     }
+                    i0 += m;
                 }
                 if (ok) { bias_now = true; apply_bias(); }
                 ph_tail = now_ms() - tt0;
@@ -1540,7 +1905,7 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: repeated prompt - DSpark re-seeded from %d saved rows (%.2f s)\n", snap_seed_n, ph_tail / 1000.0);
             }
 #endif
-            dense.prof_report("turn");
+            all_prof_report("turn");
             std::fprintf(stderr, "serve: prompt phases: %d new = %d %s (%.2f s: dense %.2f, experts %.2f, logits %.2f) + DSpark tail %d%s "
                          "(cache open %.2f s, seed %.2f s)\n", delta, dh, by_step ? "passes" : "batch", ph_feed / 1000.0,
                          (fd_dense - fd0[0]) / 1000.0, (fd_tier - fd0[1]) / 1000.0, (fd_logits - fd0[2]) / 1000.0,
@@ -1563,13 +1928,14 @@ int main(int argc, char ** argv) {
             }
             hist = ids;
             // no snapshot for an image prompt: a text request with the same ids (all image_token) would restore its embeddings
-            if (total > reused && !is_vision && dense.snapshot(total)) {
+            if (total > reused && !is_vision && all_snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
                 snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)
                 snap_seed_n = cur_seed_n;
             }
             cur_seed_n = 0;
+            prefix_capture = -1;
             if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {   // exactness checks: request N's last-row logits
                 char nb[32];
                 std::snprintf(nb, sizeof(nb), "/req%03d.f32", n_req);
@@ -1582,7 +1948,7 @@ int main(int argc, char ** argv) {
                 bias_now = true;
                 apply_bias();
             }
-            const Ds41MoeStats pst = tier.stats();
+            const Ds41MoeStats pst = sum_stats();
             std::fprintf(stderr, "serve: prompt %d tokens (%d reused, %s) in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / "
                                  "%lld pcie / %lld file)\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
                          1000.0 * (total - reused) / std::max(prompt_ms, 1e-9), (long long) pst.hits, (long long) pst.cpu,
@@ -1595,10 +1961,10 @@ int main(int argc, char ** argv) {
                 }
                 cache_open = true;
                 std::fprintf(stderr, "serve: VRAM %.2f GiB free -> %lld experts in VRAM (seed %.2f s)\n", seed_free,
-                             (long long) tier.resident(), seed_s);
+                             (long long) sum_resident(), seed_s);
             }
-            if (ok) tier.rebalance_plan();
-            tier.reset_stats();
+            if (ok) each_tier([](Ds41MoeTier & T) { T.rebalance_plan(); });
+            each_tier([](Ds41MoeTier & T) { T.reset_stats(); });
             const double td0 = now_ms();
             int gen = 0, pos = total;
             const char * finish = "length";
@@ -1608,6 +1974,7 @@ int main(int argc, char ** argv) {
             // sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact)
             long rq_pass = 0, rq_acc = 0;
             if (sp_t >= 0) {
+                live_reusable = false;   // use a captured checkpoint next turn, not speculative rolling state
                 int P = total - 1, t = sp_t, prev = ids.back();
                 bool dirty = false;
                 std::vector<int> vt;
@@ -1712,7 +2079,7 @@ int main(int argc, char ** argv) {
                     dirty = acc < k;
                     P += 1 + acc;
                     t = tn;
-                    tier.rebalance_tick();
+                    each_tier([](Ds41MoeTier & T) { T.rebalance_tick(); });
                     if (!more) break;
                 }
                 if (lk_pass > 0)
@@ -1730,13 +2097,13 @@ int main(int argc, char ** argv) {
                 ++gen;
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
-                if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
+                if (!step(tok, pos) || !stages.back()->dense.logits(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
                 ++pos;
-                tier.rebalance_tick();
+                each_tier([](Ds41MoeTier & T) { T.rebalance_tick(); });
             }
             const double dec_ms = now_ms() - td0;
-            const Ds41MoeStats st = tier.stats();
+            const Ds41MoeStats st = sum_stats();
             if (std::strcmp(finish, "error") == 0) {
                 std::fprintf(stderr, "serve: decode failed: %s\n", ferr.c_str());
                 hist.clear();
@@ -1751,12 +2118,12 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
                              1.0 + (double) rq_acc / rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
 #endif
-            tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader
+            each_tier([](Ds41MoeTier & T) { T.rebalance_tick(true); });   // the gap until the next request: retire a large batch for the reader
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);
         }
-        tier.close();
+        each_tier([](Ds41MoeTier & T) { T.close(); });
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits
         // on it until the client closes the pipe - leave without the static destructors
         std::fflush(stdout);
@@ -1766,7 +2133,7 @@ int main(int argc, char ** argv) {
 
     // ---- one-shot: prompt (+ perplexity), then generate
     if (prompt.empty()) { std::fprintf(stderr, "ds41_generate: empty prompt\n"); return 2; }
-    tier.reset_stats();
+    each_tier([](Ds41MoeTier & T) { T.reset_stats(); });
     const double tp0 = now_ms();
     std::vector<float> all;
     const int dm_tail = dump_main ? std::min<int>(128, (int) prompt.size() - 1) : 0;   // DSpark's window, as steps
@@ -1790,7 +2157,7 @@ int main(int argc, char ** argv) {
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
     for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)
-        if (!step(prompt[(size_t) i], i) || !dense.logits(0, 1, last_logits.data())) {
+        if (!step(prompt[(size_t) i], i) || !stages.back()->dense.logits(0, 1, last_logits.data())) {
             std::fprintf(stderr, "ds41_generate: dump-main prompt step: %s\n", ferr.c_str());
             return 1;
         }
@@ -1826,9 +2193,9 @@ int main(int argc, char ** argv) {
     if (defer_vram && dm_tail == 0 && !spec) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
         if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
-                     seed_free, seed_gib, (long long) tier.resident(), seed_s);
+                     seed_free, seed_gib, (long long) sum_resident(), seed_s);
     }
-    const Ds41MoeStats pst = tier.stats();
+    const Ds41MoeStats pst = sum_stats();
     std::fprintf(stderr, "\nprompt: %zu tokens in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / %lld pcie / %lld file)\n",
                  prompt.size(), prompt_ms / 1000.0, 1000.0 * prompt.size() / prompt_ms, (long long) pst.hits,
                  (long long) pst.cpu, (long long) pst.pcie, (long long) pst.file_tier);
@@ -1854,7 +2221,7 @@ int main(int argc, char ** argv) {
         std::ofstream f(a.dump_last, std::ios::binary);
         f.write((const char *) last_logits.data(), (std::streamsize) (last_logits.size() * 4));
     }
-    tier.reset_stats();
+    each_tier([](Ds41MoeTier & T) { T.reset_stats(); });
     // STRATA_PROFILE_DECODE=1: nsys --capture-range=cudaProfilerApi captures exactly the decode
     static const bool prof_decode = std::getenv("STRATA_PROFILE_DECODE") != nullptr;
     if (prof_decode) Ds41MoeTier::profiler(true);
@@ -1884,7 +2251,7 @@ int main(int argc, char ** argv) {
     // from inside the pass).
     // STRATA_ROUTE_TRACE=<file> (measurement only): the verify passes' routing + acceptance, for
     // tools/v41/sim/route_sim.py (session 13: in-pass draft pruning and the VRAM replacement policy, replayed offline)
-    if (const char * rt = std::getenv("STRATA_ROUTE_TRACE")) tier.trace_open(rt);
+    if (const char * rt = std::getenv("STRATA_ROUTE_TRACE")) each_tier([rt](Ds41MoeTier & T) { T.trace_open(rt); });
     long sp_pass = 0, sp_acc = 0, sp_refeed = 0, sp_full = 0;
     const bool sp_noacc = std::getenv("STRATA_DSPARK_NOACC") != nullptr;
     double sp_vms = 0, sp_dms = 0;
@@ -1951,7 +2318,7 @@ int main(int argc, char ** argv) {
             {   // STRATA_ROUTE_TRACE: 'P' {m, k, acc, refeed, verify ms, conf p0..p4}
                 float pm[10] = { (float) vt.size(), (float) k, (float) acc, (float) refeed, (float) (now_ms() - tv) };
                 for (int i = 0; i < 5; ++i) pm[5 + i] = i < spec_depth ? sig(sp_conf[i]) : 0.0f;
-                tier.trace_mark(pm, 10);
+                each_tier([pm](Ds41MoeTier & T) { T.trace_mark(pm, 10); });
             }
             int spos[6];
             for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
@@ -1987,12 +2354,12 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
         if (gen + 1 == a.n_predict) { ++gen; break; }
-        if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (!step(tok, pos) || !stages.back()->dense.logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
         ++pos;
     }
     const double dec_ms = now_ms() - td0;
     if (prof_decode) Ds41MoeTier::profiler(false);
-    const Ds41MoeStats st = tier.stats();
+    const Ds41MoeStats st = sum_stats();
     std::fprintf(stderr, "decode: %d tokens in %.2f s = %.2f tok/s; experts %lld hit / %lld cpu / %lld pcie / %lld file "
                  "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms; spec reads %lld issued / %lld used; prefetch %lld issued / "
                  "%lld outside the arena / %lld used\n",
@@ -2022,6 +2389,6 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, " k=%d %lld/%lld/%lld", k, fp_cand[k][0], fp_cand[k][1], fp_cand[k][2]);
         std::fprintf(stderr, "\n");
     }
-    tier.close();
+    each_tier([](Ds41MoeTier & T) { T.close(); });
     return 0;
 }

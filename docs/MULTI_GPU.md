@@ -351,3 +351,111 @@ These are opt-in settings on one rig, not defaults.
 
 With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
 pipelines them through the cards: see [BATCHING.md](BATCHING.md).
+
+## The DeepSeek-V4.1 engine (`tools/v41`, `--split`)
+
+The V4.1 / V4-Flash engine (`ds41_generate`) now carries its own half of this: `--split K[,K2..]` with
+`--split-device D1,D2,..`. Same shape as `--layer-split` - contiguous layer ranges, one card each, the last card
+also runs the output head - but it is its own driver, so it spells the flag `--split` and takes layer ids, never
+"auto". `K` is the FIRST layer of each later card: `--split 20` on the 40-layer model leaves layers 0-19 on CUDA0
+and puts 20-39 plus the head on CUDA1; `--split-device 1` names that card (default 1, 2, 3, ..). A server
+config's `"layer_split"` reaches whichever engine it starts, in that engine's words.
+
+**What each stage holds.** Its layers' dense weights and persistent state (KV rings, index state, the Engram rows
+its layers read), and its layers' expert cache and RAM arena - the rule above, unchanged: two cards hold about
+twice the experts one card holds. Each stage sizes its cache against the VRAM free on its own card AT THE MOMENT
+IT SEEDS, not against the figure read before the other stage's weights were loaded (that over-committed by
+exactly the other stage's weights: stage 0 measured 15.58 GiB free, seeded 14.58 GiB of slots, and the card held
+10.91 by seed time). Two stages sharing one card divide what is left by their layer counts; a stage left with no
+room says so and runs its arena / file tier with the cache off.
+
+**The boundary.** Activations cross once per pass through one pinned + mapped + portable buffer that the WRITING
+stage owns - `x_state` then `pre_state`, the hyper-connection state - copied after that stage's last layer and
+imported before the next stage's first; the last stage never allocates one. A split point is accepted only when
+it is state-closed: every later layer's kv / index source and the candidate block stay on the same side (for the
+40-layer file: 2, 8, 14, 20). A rejected `K` prints the legal set read off the file.
+
+**Refused, not degraded:** `--backend cpu`, `--experts cpu`, `--prompt-batch > 1` (the layer-major prompt batch
+has no mid-model start), `--vision`, DSpark (`STRATA_DSPARK` / `STRATA_SERVE_DSPARK`), two stages on a card other
+than the first, and a `K` below 2, at or above `n_layer`, or not rising.
+
+**Which card first.** Stage 0 is the first CUDA device the process sees, so put the faster card there with
+`CUDA_VISIBLE_DEVICES=1,0` (kernel ordinals are then 0 = the physical second card). On the test PC that order was
+9% faster in decode than the reverse.
+
+**Measured (2 x RTX 3090, 2026-10-19).**
+- A 4-layer synthetic V4.1 file (hidden 256, 16 experts, IQ2_XXS) run three ways - unsplit with all 64 experts in
+  VRAM, split on one card with `--slots 1`, and split with stage 1 on the second card (`--split-device 1`) -
+  dumps **bit-identical logits and tokens** in all three. With every expert resident the cross-card split and the
+  unsplit run agree bit for bit (all logits, all token ids), and the two RTX 3090s agree bit for bit with each
+  other on the same input. At a fixed cache state, placement moves nothing.
+- The GSQ file split at layer 20 on one card (`--split-device 0`, the hand-off's own A/B) loads, seeds both stages
+  (517 and 297 experts in VRAM, an 8.0 GiB arena each) and runs. Its prompt logits sit 0.003 (first row) to 0.16
+  (mean per row) from the unsplit run and its first generated token matches. That gap is the engine's cache
+  sensitivity, not the split's: two UNSPLIT runs of the same file differing only in cache size (`--slots 1` vs
+  `--slots 2`) differ by MORE - 0.004 to 0.28 mean per row. As upstream puts it, the hand-off is bit-exact;
+  matching greedy text needs matching expert caches.
+- The default path (no `--split`) is byte-identical to the build from before this work:
+  `tools/v41/vision/check_text_regression.py` against that binary reports the sequential, chunked and layer-major
+  arms' logits, last-token logits and token ids identical - every compared artifact - on the GSQ file.
+
+**Measured on the real server path (GSQ file, `rank.bin`, real-text fixtures, 60+ GiB RAM arena; `--serve`,
+mean of 2 requests, 1024-token prompt / 128 generated unless noted; 2026-10-19).**
+
+| Arm | DSpark | prompt-batch | arena GiB | prompt tok/s | decode tok/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| one GPU, server config (`--kv-fp4 --arena-adapt --route-bias 0.5/0.3`, ctx 32K) | on | 12288 | 64 | 62.0 | **19.2** |
+| one GPU, engine defaults | on | 8192 | 60 | 61.4 | 24.5 |
+| one GPU, no DSpark | off | 1 | 60 | 24.1 | 24.7 |
+| two GPUs, split 20, stage 0 on x16 | off | 1 | 32+32 | 21.3 | 15.5 |
+| two GPUs, split 20, stage 0 on x4 | off | 1 | 32+32 | 21.3 | 17.1 |
+| two stages, both on the x16 card | off | 1 | 32+32 | 21.8 | 22.4 |
+| one GPU, no DSpark, 128-token prompt | off | 1 | 60 | 24.0 | 29.2 |
+| two GPUs, 128-token prompt | off | 1 | 32+32 | 20.6 | 26.2 |
+
+- **The server config reproduces**: 19.2 tok/s decode and 62 tok/s prefill with DSpark, `--kv-fp4`, arena-adapt and
+  the x0.5 bias on a 1024-token real-text prompt. The previous session's A/B on this host measured 24-28 tok/s with
+  engine defaults, matching the 24.5 here.
+- **A split cannot run that config yet.** `--split` refuses DSpark (the draft stack's backend is stage 0's) and
+  `--prompt-batch > 1` (the layer-major prompt batch has no mid-model entry). The two rows above it are the
+  like-for-like pair the split can do today.
+- **Two cards are slower than one here**: -37% decode at 1024-token context, -10% at 128. The stage loop itself
+  costs ~9% (two stages, one card: 22.4 vs 24.7); the cross-card rendezvous is the rest, and its cost grows with
+  context (~+4 ms/token at 128 tokens, ~+20 ms/token at 1024, against a 40 ms token). Card order is within noise
+  at 32K (15.5 x16-first vs 17.1 x4-first).
+- The split's doubled VRAM cache does raise expert hits, but not enough to pay for the boundary while the hot
+  experts are RAM-resident. Profiling the hand-off is the next step before a split can claim a speed win.
+- Full artifacts (raw logs, per-run JSON, README): `~/models/benchmarks/dsv41-1gpu-vs-2gpu-2026-10-19/`.
+- The same pair on the acrogenesis **1017 IQ2_XXS** release (10 shards, 2026-10-20, rank profile reused): one card
+  25.2 tok/s decode / 25.8 prefill, split across both 16.9 / 23.7. The two-card cost reproduces on the other file;
+  artifacts in `~/models/benchmarks/dsv41-1017-1gpu-2026-10-20/`.
+
+**Small-arena case (8 GiB RAM arena, file-bound, 8-token prompt, 32-token decode, `--arena-gib 8`).**
+
+| Arm | Decode tok/s | VRAM hits | Expert file wait |
+| --- | ---: | ---: | ---: |
+| unsplit, the x16 card | **2.09** | 10.0% | 10.9 s / 32 tok |
+| split 20, stage 0 on the x16 card | 1.54 | 27.3% | 9.4 s |
+| split 20, stage 0 on the x4 card | 1.41 | 27.2% | 9.0 s |
+| split 20, both stages on the x16 card | 2.10 | 10.2% | - |
+| split 8 (unbalanced), stage 0 on x16 | 1.11 | 25.0% | - |
+
+- **The cross-device boundary costs ~140 ms per token** at split 20 (8 tokens: 0.56 s/token across cards vs
+  0.42 s on one card, and the same gap at 32 tokens). The same binary with both stages on one card spends nothing
+  on it (2.10 tok/s) - the cost is the per-pass rendezvous and copy between cards, not the stage loop. The copy
+  itself is 80 KiB (`x_state`, `pre_state`); the sync is what the next profile should explain.
+- The split's doubled cache works (10% -> 27% of routed experts in VRAM, file wait -14%) but does not pay for the
+  boundary while decode is NVMe-bound. On this rig, with a small arena, two cards are **slower** than the x16 card
+  alone; the x16-first order is ~9% ahead of x4-first. A larger RAM arena (or more expert slots) is where the split
+  can win, and that is the next measurement to make.
+- **Served (`--serve`), matched flags** (`--prompt-batch 1`, 512-token prompt, 8 tokens): unsplit on the x16 card
+  2.05 prompt tok/s and 2.33 decode tok/s; the same run split at 20 across both cards 1.56 and 1.74. The same ~30%
+  cross-device cost, now on the path the API uses.
+- **Determinism.** With the cache state fixed, each arm repeats exactly: three runs per arm, md5-identical token
+  streams, in all three arms (unsplit, split on one card, split across cards). Across runs the dynamic VRAM cache
+  can settle at a slightly different fill - 32 tokens: 2032 vs 2022 expert hits - and that alone changes the tokens,
+  the same cache sensitivity as above, not a placement effect.
+- A served split run still has to pass `--prompt-batch 1`; the engine exits 2 with that message otherwise. With a
+  warm 60+ GiB arena that costs little on its own (1024 tokens in ~45-48 s, 21-24 tok/s); with the 8 GiB arena it
+  is per-token passes (250 s for 512 tokens). A batch entry for stages past layer 0 is what would let a split keep
+  the batched prompt path, and DSpark's backend needs to follow the last stage; neither is implemented.

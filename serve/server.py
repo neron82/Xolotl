@@ -2655,10 +2655,11 @@ def layer_split_of(cfg: dict) -> bool:
     return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
 
 
-def engine_args(cfg: dict) -> list[str]:
+def engine_args(cfg: dict, exe: str | None = None) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
-    layer_split_value)."""
+    layer_split_value).  `exe` names the engine binary: the DS41 engine (tools/v41, ds41_generate) calls the same
+    thing --split and takes layer ids, never "auto", so its share is spelled in its own words."""
     args = list(cfg["args"])
     # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited by
     # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
@@ -2672,10 +2673,14 @@ def engine_args(cfg: dict) -> list[str]:
             note += " and --vram-reserve-mib 700"
         print(f'[strata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
               "--vision to write them)", flush=True)
-    if layer_split_of(cfg) and "--layer-split" not in args:
-        args += ["--layer-split", layer_split_value(cfg)]
-    # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
-    if layer_split_of(cfg) and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
+    split_flag = "--split" if str(exe or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1].startswith("ds41") else "--layer-split"
+    if layer_split_of(cfg) and split_flag not in args and "--layer-split" not in args and "--split" not in args:
+        if split_flag == "--split" and layer_split_value(cfg) == "auto":
+            print('[strata] "layer_split": the DS41 engine wants --split with the first layer of each later GPU '
+                  '(e.g. "20" for two cards), not "auto": starting it on one card', flush=True)
+        else:
+            args += [split_flag, layer_split_value(cfg)]
+    if split_flag == "--layer-split" and layer_split_of(cfg) and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
         args.append("--split-skip-if-fits")
     # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
     # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512)
@@ -6774,7 +6779,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     def one(i: int):
         rc = rp.replica_cfg(cfg, i, groups[i])
         try:
-            engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+            engines[i] = StrataEngine(exe, engine_args(rc, exe) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=child_env(rc), lazy=lazy, cpus=cpus[i] if cpus else None)
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
@@ -6977,7 +6982,7 @@ def main() -> int:
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
         else:
-            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+            engine = StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))

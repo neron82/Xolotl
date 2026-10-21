@@ -39,6 +39,7 @@ struct Ds41DenseConfig {
     /// experts run ONCE per layer over the whole batch (begin_batch / attn_router_span / finish_span).
     int     prompt_batch = 0;
     bool    skip_routed_experts = true; ///< do not load the routed experts (the tier owns them)
+    bool    external_experts = false;   ///< EXL3 supplies the routed tensors; a dense-only GGUF may omit them
     /// Directories holding the HF shards with the Engram tables (model.safetensors.index.json in the first).
     /// Empty = no Engram (its add is skipped: a debugging mode, the model is then not the model).
     std::vector<std::string> engram_dirs;
@@ -57,6 +58,12 @@ struct Ds41DenseConfig {
     /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
     bool    elastic_cols = false;
     bool    vision = false;            ///< opt-in image embeddings, VL routing and Engram masking
+    /// Contiguous layer range this instance loads and runs (the layer split, docs/MULTI_GPU.md semantics):
+    /// `layer_lb` is the first block, `layer_le` one past the last; `layer_le = 0` = every block in the file
+    /// (today, byte-identical).  A stage loads `blk.<n>` only for n in [lb, le), `token_embd.weight` only when
+    /// lb == 0 and the head (`output.weight` + `output_norm.weight`) only when le == n_layer().
+    int64_t layer_lb = 0;
+    int64_t layer_le = 0;
 };
 
 class Ds41Dense {
@@ -82,17 +89,39 @@ public:
     int64_t n_layer() const;
     ggml_backend_t backend() const;
 
+    /// First block this instance runs / one past the last (n_layer() when the range is unset).
+    int64_t layer_lb() const;
+    int64_t layer_le() const;
+    /// Boundary buffers for a split pass.  One pinned+mapped+portable host buffer per boundary, allocated by the
+    /// stage that WRITES it (cudaHostAlloc(MAPPED|PORTABLE) + cudaHostGetDevicePointer, the pattern at
+    /// src/program/generate.cpp:7818-7833), sized `cols * 2 * hc * n_embd` floats where cols = max(max_pass,
+    /// prompt_batch) - the same column count the state tensors use.  A no-op when this stage owns the last block.
+    bool open_handoff(std::string & err);
+    /// The device pointer of this stage's buffer, for the driver to hand to the next stage.
+    float * handoff_dev();
+    /// After this stage's last layer: copy the pass's cross-layer state out (x_state and pre_state, columns
+    /// [0, n) ).  CPU backend: a plain host memcpy.
+    bool handoff_out(int n, std::string & err);
+    /// The previous stage's buffer, set on the stage that READS it before its first layer.
+    void set_handoff_in(const float * dev);
+    /// Before this stage's first layer: copy that state into this stage's own state tensors for columns [0, n).
+    /// Requires set_handoff_in() to have been called.
+    bool handoff_in(int n, std::string & err);
+    /// begin() for a stage that starts a pass mid-model: no embeddings, no stage-0 work.  Sets the pass's
+    /// columns/positions, uploads this stage's own Engram rows (its Engram layers inside [layer_lb, layer_le) ),
+    /// and pairs with handoff_in(n).  `tids` covers positions pos0-3 .. pos0+n-1 (the n-gram hash window),
+    /// `ntids` its length.
+    bool begin_from_handoff(const int * tids, int ntids, int n, int pos0);
+
     /// Start a pass: tokens tids[0..n) at positions pos0.., n <= max_pass.  Embeddings + Engram rows (the hash
     /// needs the 3 tokens before pos0: the history is kept by position, so a re-decoded position overwrites it).
     bool begin(const int * tids, int n, int pos0);
     /// Layer-major prompt batch (cfg.prompt_batch > 0): the whole batch's inputs are prepared once - embeddings,
     /// positions, window / compressed / indexer index maps, Engram rows and the initial x/pre state - into the state
     /// tensors' columns 0..B-1; then attn_router_span / finish_span walk layer il's sub-batches in order.  B <=
-    /// cfg.prompt_batch (the state columns) and B <= ctx_max - pos0.  Every cross-layer dependency of the sequential
-    /// chunk path (the per-layer KV ring / compressed rows / indexer state advances in sub-batch order; layer l's
-    /// residual and pre-mix are the columns the sub-batch used) is preserved, so the outputs match --prefill-chunk.
+    /// prompt_batch and B <= ctx_max - pos0. Every cross-layer dependency of the sequential chunk path is preserved.
     bool begin_batch(const int * tids, int B, int pos0);
-    /// Dense half of layer il for the batch's sub-batch starting at column col0 (n tokens, col0 % max_pass == 0):
+    /// Dense half of layer il for a span inside one max_pass-aligned sub-batch (no crossing its end):
     /// attention, hc, router, shared expert + the Engram add.  ids / wts / fn land in the batch buffers (batch_ids /
     /// batch_wts / batch_fn) at column col0.  Uses (and advances) layer il's own KV state in sub-batch order.
     bool attn_router_span(int il, int col0, int n);
@@ -159,6 +188,13 @@ public:
     bool snapshot(int pos);
     bool restore();
     int snapshot_pos() const;
+    /// Independent pre-tail checkpoint for templates that rewrite their final generation marker next turn.
+    /// il >= 0 captures just that layer (layer-major prefill); -1 captures every layer between passes.
+    /// The caller must capture every layer at the same position before restoring. pos < 0 invalidates it.
+    /// Host-backed and allocated on first use; persistent rings survive set_columns().
+    bool snapshot_prefix(int pos, int il = -1);
+    bool restore_prefix();
+    int prefix_snapshot_pos() const;
     /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
     /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.
     /// park(n) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to host
@@ -168,6 +204,9 @@ public:
     bool unpark();
     void drop_park();
     bool parked() const;
+    /// After unpark, restore the text prefix's Engram look-back (the unrelated request rewrote its token history).
+    /// Only the final ngram-1 tokens are needed; image prompts are not parked by the serve driver.
+    void restore_token_history(const int * tids, int n);
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns

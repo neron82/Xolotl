@@ -30,6 +30,7 @@ template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 4, step = 1;
 // against the working tree: ~/AI/Strata-GLM/build-glm-gpu/glm_generate passes the same point and prints
 // "moe lora: routed-expert deltas on 26 layer(s) (n_embd 4096, n_ff 2048)".  Fmt<12>/Fmt<18>/Fmt<22> are all
 // defined in this build, so this is the whole fix (see HANDOFF.md §6).
+// Maya-S 1017 also uses IQ3_S (21) down projections; its existing Fmt<21> dot product works in this path too.
 #define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(143)
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(18) X(22) X(39) X(143)
+#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(18) X(21) X(22) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(143)

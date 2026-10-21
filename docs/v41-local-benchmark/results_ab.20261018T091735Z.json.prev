@@ -1,0 +1,97 @@
+{
+  "created_utc": "2026-10-18T09:08:45.791346+00:00",
+  "harness": "/home/neron/projects/xolotl/docs/v41-local-benchmark/benchmark_server_ab.py",
+  "manifest": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab.json",
+  "config": {
+    "repo": "/home/neron/projects/xolotl",
+    "model": "/home/neron/models/Deepseek-V41-GSQ/V41-GSQ.gguf",
+    "rank": "/home/neron/models/Deepseek-V41-GSQ/rank.bin",
+    "engram": "/home/neron/models/Deepseek-FP8-engram/layers.1:/home/neron/models/Deepseek-FP8-engram/layers.14",
+    "sidecar": "/home/neron/models/Deepseek-V41-GSQ/V41-MTP-Vision.Q2_K.gguf",
+    "ctx": 8192,
+    "arena_gib": null,
+    "prompt_batch": "engine default (8192 in serve)",
+    "prefill_chunk": "engine default (512 with a layer-major batch)",
+    "route_bias": "launcher/engine defaults (not overridden by this harness)",
+    "serve_park": 0,
+    "physical_gpu": 1,
+    "cuda_visible_devices": "the engine has no device flag; the launcher is started as-is (CUDA_VISIBLE_DEVICES is inherited)",
+    "reps": 3,
+    "warmup_per_arm": 2,
+    "launcher": "/home/neron/projects/xolotl/docs/v41-local-benchmark/run_engine_fg.sh",
+    "memguard": "local launcher scope (MemoryMax=110G, MemorySwapMax=0) + shared flock + host watchdog floor 4 GiB",
+    "memguard_max_gib": 110,
+    "watchdog_floor_gib": 4,
+    "preload_mem_floor_gib": 70,
+    "run_mem_floor_gib": 8,
+    "min_mem_available_gib": 70,
+    "min_free_vram_mib": 22000,
+    "initial_mem_available_gib": 115.15,
+    "initial_swap_gib": {
+      "total": 1.9999961853027344,
+      "free": 0.1072845458984375
+    },
+    "initial_nvidia_smi": "0, 00000000:07:00.0, 1053, 23074, 0, 24576\n1, 00000000:2B:00.0, 333, 23785, 0, 24576"
+  },
+  "arms": {
+    "mtp": {
+      "warmup": [],
+      "results": [],
+      "engine": {
+        "started_utc": "2026-10-18T09:10:01.573460+00:00",
+        "command": [
+          "/bin/bash",
+          "/home/neron/projects/xolotl/docs/v41-local-benchmark/run_engine_fg.sh",
+          "-m",
+          "/home/neron/models/Deepseek-V41-GSQ/V41-GSQ.gguf",
+          "--backend",
+          "cuda",
+          "--experts",
+          "gpu",
+          "--engram",
+          "/home/neron/models/Deepseek-FP8-engram/layers.1:/home/neron/models/Deepseek-FP8-engram/layers.14",
+          "--rank",
+          "/home/neron/models/Deepseek-V41-GSQ/rank.bin",
+          "--ctx",
+          "8192",
+          "--serve"
+        ],
+        "stdout_log": "/home/neron/projects/xolotl/docs/v41-local-benchmark/runs_ab/20261018T090845Z.mtp.server.stdout.log",
+        "stderr_log": "/home/neron/projects/xolotl/docs/v41-local-benchmark/runs_ab/20261018T090845Z.mtp.server.stderr.log",
+        "trace": "/home/neron/projects/xolotl/docs/v41-local-benchmark/runs_ab/20261018T090845Z.mtp.trace.jsonl",
+        "ready_line": "READY 8192 stop",
+        "info_line": "INFO ctx=8192 experts_vram=0 arena_experts=6708",
+        "load_seconds": 75.621,
+        "notes": [
+          "memguard: scope ds41-bench-1629687 MemoryMax=110G swap=0 floor=4 GiB (avail 115 GiB, need 70 GiB pre-load)"
+        ],
+        "memguard_scope_line": "memguard: scope ds41-bench-1629687 MemoryMax=110G swap=0 floor=4 GiB (avail 115 GiB, need 70 GiB pre-load)",
+        "scope": {
+          "unit": "ds41-bench-1629687",
+          "max_gib": 110,
+          "swap_gib": 0,
+          "watchdog_floor_gib": 4
+        },
+        "dspark_intent": "/home/neron/models/Deepseek-V41-GSQ/V41-MTP-Vision.Q2_K.gguf",
+        "dspark_state": {
+          "intent": "on",
+          "env_value": "/home/neron/models/Deepseek-V41-GSQ/V41-MTP-Vision.Q2_K.gguf",
+          "sidecar_load_lines": [],
+          "verified": false
+        },
+        "gpu_before": "0, 00000000:07:00.0, 1053, 23074, 0, 24576\n1, 00000000:2B:00.0, 333, 23785, 0, 24576",
+        "mem_available_before_gib": 115.125,
+        "stopped_utc": "2026-10-18T09:10:09.497707+00:00",
+        "exit_code": 0,
+        "dspark_sidecars_loaded": [],
+        "mem_available_after_gib": 114.698,
+        "gpu_after": "0, 00000000:07:00.0, 1053, 23074, 0, 24576\n1, 00000000:2B:00.0, 333, 23785, 16, 24576"
+      }
+    },
+    "nomtp": {
+      "warmup": [],
+      "results": [],
+      "engine": {}
+    }
+  }
+}

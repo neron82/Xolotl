@@ -30,6 +30,7 @@
 #include <thread>
 #include <utility>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -39,9 +40,11 @@
 
 #if defined(DS4_MOE_CUDA)
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/on_device.hpp"   // slice B: cfg.device >= 0 wraps the tier's CUDA calls in OnDevice
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/exl3.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
@@ -50,7 +53,18 @@
 #endif
 #endif
 
+#if defined(DS4_MOE_CUDA)
+void ds41_exl3_swiglu(const float* gate, const float* up, float* out, long long n, float limit, cudaStream_t s);
+void ds41_exl3_scatter_add(const float* part, const int* tok, const float* w, int n, int H, float* out, cudaStream_t s);
+void ds41_exl3_gather(const float* x, const int* pairs, int K, int n, int H, float* out, cudaStream_t s);
+void ds41_exl3_scatter(const float* part, const int* pairs, int n, int H, float* out, cudaStream_t s);
+void ds41_exl3_sum(const float* parts, const float* w, const int* order, int n, int K, int H, float* out, cudaStream_t s);
+#endif
+
 namespace cpu = strata::kernels::cpu;
+#if defined(DS4_MOE_CUDA)
+namespace x3 = strata::kernels::exl3;
+#endif
 
 namespace strata::v41 {
 
@@ -64,6 +78,11 @@ constexpr size_t kMetaBytes = 65536;   ///< one call's grouped-launch metadata (
 constexpr int kMetaSites = 3;   ///< gpu_run's grouped-launch sites: the VRAM hits, the PCIe share, the file misses
 constexpr int kMetaClsMax = 9;  ///< DS4 is per_expert = 9 format classes, each getting a fixed metadata slot (slice B)
 constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what route_probe tokenises)
+
+bool exl3_fast() {
+    static const bool enabled = std::getenv("STRATA_EXL3_FAST") && std::atoi(std::getenv("STRATA_EXL3_FAST")) != 0;
+    return enabled;
+}
 
 [[maybe_unused]] double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -312,7 +331,64 @@ struct SpecStash {
 };
 
 /// All the device state, so the CPU-only flavour has none of it to leak.
+struct Exl3Chunk {
+    static constexpr int batch = 8;
+    int tokens = 0, rows = 0;
+    void *x = nullptr, *pairs = nullptr, *weights = nullptr, *parts = nullptr, *out = nullptr, *order = nullptr;
+    void *gather = nullptr, *gate = nullptr, *up = nullptr, *hidden = nullptr, *product = nullptr;
+    void* stage[2] = {};
+    uint8_t* host[2] = {};
+    cudaStream_t copy = nullptr;
+    cudaEvent_t copied[2] = {}, used[2] = {};
+
+    void release() {
+        for (void* p : {x, pairs, weights, parts, out, order, gather, gate, up, hidden, product, stage[0], stage[1]})
+            if (p) cudaFree(p);
+        x = pairs = weights = parts = out = order = gather = gate = up = hidden = product = nullptr;
+        stage[0] = stage[1] = nullptr;
+        tokens = rows = 0;
+    }
+    void close() {
+        release();
+        for (int i = 0; i < 2; ++i) {
+            if (host[i]) cudaFreeHost(host[i]);
+            if (copied[i]) cudaEventDestroy(copied[i]);
+            if (used[i]) cudaEventDestroy(used[i]);
+        }
+        if (copy) cudaStreamDestroy(copy);
+        *this = Exl3Chunk();
+    }
+    void open(int n, int nr, int H, int FF, int K, size_t blob, cudaStream_t s) {
+        if (!copy) {
+            ck(cudaStreamCreateWithFlags(&copy, cudaStreamNonBlocking), "exl3 copy stream");
+            for (int i = 0; i < 2; ++i) {
+                ck(cudaEventCreateWithFlags(&copied[i], cudaEventDisableTiming), "exl3 copied event");
+                ck(cudaEventCreateWithFlags(&used[i], cudaEventDisableTiming), "exl3 used event");
+                ck(cudaMallocHost((void**) &host[i], batch * blob), "exl3 reader slab");
+            }
+        }
+        if (tokens >= n && rows >= nr) return;
+        ck(cudaStreamSynchronize(s), "exl3 resize compute");
+        ck(cudaStreamSynchronize(copy), "exl3 resize copies");
+        release();
+        tokens = n;
+        rows = nr;
+        ck(cudaMalloc(&x, (size_t) n * H * 4), "exl3 input batch");
+        ck(cudaMalloc(&pairs, (size_t) n * K * 4), "exl3 pair indices");
+        ck(cudaMalloc(&order, (size_t) n * K * 4), "exl3 sum order");
+        ck(cudaMalloc(&weights, (size_t) n * K * 4), "exl3 pair weights");
+        ck(cudaMalloc(&parts, (size_t) n * K * H * 4), "exl3 ordered parts");
+        ck(cudaMalloc(&out, (size_t) n * H * 4), "exl3 batch output");
+        const size_t rowbytes = (size_t) nr * std::max(H, FF) * 4;
+        for (void** p : {&gather, &gate, &up, &hidden, &product})
+            ck(cudaMalloc(p, rowbytes), "exl3 expert rows");
+        for (int i = 0; i < 2; ++i) ck(cudaMalloc(&stage[i], batch * blob), "exl3 staging slab");
+    }
+};
+
 struct Gpu {
+    int device = -1;          ///< cfg.device: the card every stream, buffer, graph and slot here lives on
+                              ///< (-1 = the caller's current device, today; set by init, used by the OnDevice guards)
     Arena arena;
     std::unique_ptr<SpecStash> spec;   ///< spec_read's stash (opened on first use)
     std::unique_ptr<ReadPool> rpool;   ///< D3's file-tier readers (persistent; created on first use)
@@ -325,6 +401,12 @@ struct Gpu {
     uint8_t* h_fstage = nullptr;       ///< run(): file-tier misses read here (pinned), then DMA'd (kMaxParts blobs)
     void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_grp_ptr = nullptr, *d_grp_start = nullptr,
          *d_ngroups = nullptr, *d_ent_dst = nullptr, *d_ent_tok = nullptr, *d_scratch = nullptr, *d_stage = nullptr;
+    /// EXL3: the six entries' gate and up products, their clamped SwiGLU, the top-k weights and the summed row.
+    void *d_exl3_gate = nullptr, *d_exl3_up = nullptr, *d_exl3_h = nullptr, *d_exl3_w = nullptr, *d_exl3_out = nullptr;
+    void *d_exl3_xg = nullptr, *d_exl3_gb = nullptr, *d_exl3_ub = nullptr, *d_exl3_hb = nullptr, *d_exl3_pb = nullptr,
+         *d_exl3_ob = nullptr, *d_exl3_ptok = nullptr, *d_exl3_pw = nullptr;
+    int64_t xl_ob_tok = 0;
+    Exl3Chunk xl_chunk;
     cudaEvent_t ev[4] = {};
     void* d_pf = nullptr;         ///< kMaxPf staging slots, one expert blob each
     cudaStream_t s_pf = nullptr;  ///< the prefetch stream (never the main one: the DMAs run under the dense work)
@@ -412,12 +494,14 @@ struct Gpu {
     }
 
     void close() {
+        xl_chunk.close();
         for (auto& e : ev)
             if (e) cudaEventDestroy(e);
         for (cudaGraphExec_t g : tier_g)
             if (g) cudaGraphExecDestroy(g);
         void* bufs[] = {d_x, d_xq, d_parts, d_grp_ptr, d_grp_start, d_ngroups, d_ent_dst, d_ent_tok, d_scratch,
-                        d_stage, d_pf, d_meta};
+                        d_stage, d_pf, d_meta, d_exl3_gate, d_exl3_up, d_exl3_h, d_exl3_w, d_exl3_out,
+                        d_exl3_xg, d_exl3_gb, d_exl3_ub, d_exl3_hb, d_exl3_pb, d_exl3_ob, d_exl3_ptok, d_exl3_pw};
         if (h_meta) cudaFreeHost(h_meta);
         if (h_fstage) cudaFreeHost(h_fstage);
         for (void* p : bufs)
@@ -515,6 +599,8 @@ struct ChunkStage;   ///< chunk_prefetch's two pinned slabs (defined below, afte
 struct Ds41MoeImpl {
     Ds41MoeGeom g;
     Ds41MoeConfig cfg;
+    int device = -1;              ///< cfg.device, or -1 for cpu_only / unset: the OnDevice guards make no CUDA call
+    int64_t lb = 0, le = 0;       ///< the layer range served: [lb, le); init resolves le to n_layers when cfg.layer_le is 0
     Ds41BlobSource* blobs = nullptr;
     std::unique_ptr<Ds41BlobSource> owned_blobs;
     cpu::NativeFmt f;                 ///< the largest routed layer's (buffer sizing; the uniform geometry's only one)
@@ -600,6 +686,24 @@ const uint8_t* acquire(Ds41MoeImpl& im, int64_t layer, int64_t expert, int scrat
 void reserve_ftmp(Ds41MoeImpl& im, int n) {
     const size_t need = (size_t) std::max<int64_t>(im.g.top_k, n) * (size_t) im.blob;
     if (im.ftmp.size() < need) im.ftmp.resize(need);
+}
+
+/// Split tier (slice B): whether `layer` is outside the layer range this tier serves.  False - every routed
+/// layer, exactly as before - when no range is set (cfg.layer_lb = cfg.layer_le = 0; init resolves le to
+/// n_layers).  The seeding paths filter their ranking with it; the run entry points refuse with `range_reject`.
+bool out_of_range(const Ds41MoeImpl& im, int64_t layer) {
+    if (!(im.cfg.layer_lb > 0 || im.cfg.layer_le > 0)) return false;
+    return layer < im.lb || layer >= im.le;
+}
+
+/// ... and the error form the bool entry points use: true (refuse the request) with *err set when `err` is
+/// given.  A layer outside the range would otherwise be a SILENT file-tier miss - correct output, ~2 ms of NVMe
+/// per expert, on the tier that does not own the layer.
+bool range_reject(const Ds41MoeImpl& im, int64_t layer, std::string* err) {
+    if (!out_of_range(im, layer)) return false;
+    if (err) *err = "layer " + std::to_string(layer) + " is outside this tier's range [" +
+                    std::to_string(im.lb) + ", " + std::to_string(im.le) + ")";
+    return true;
 }
 
 // ================================ prompt-prefill expert staging ================================
@@ -785,6 +889,7 @@ void chunk_stage_join(Ds41MoeImpl& im, int s) {
 /// (else by what host RAM can spare above cfg.mem_floor_gib).  False = prefetch off (a layer would not fit, or the
 /// pinned allocation failed) - the caller then leaves run_chunk's on-demand reader in charge.
 bool chunk_stage_alloc(Ds41MoeImpl& im) {
+    const strata::core::OnDevice on_dev(im.device);   // the pinned slabs are DMA'd by the tier's card: pin them for its context
     if (im.cstage) return true;
     if (im.cfg.cpu_only || !im.gpu) return false;
     im.cstage.reset(new ChunkStage());
@@ -902,6 +1007,41 @@ uint8_t* nact_slot_n(Ds41MoeImpl& im, int t, int gu_act) {
 
 // ================================ geometry ================================
 
+namespace {
+
+struct Ds41Exl3Layout {
+    size_t suh[3] = {}, svh[3] = {}, trellis[3] = {};
+    int k2[3] = {};
+    size_t bytes = 0;
+};
+
+inline size_t align256(size_t n) { return (n + 255) & ~(size_t) 255; }
+
+/// [suh gate | svh gate | trellis gate | ... up | ... down], each role 256-byte aligned.  Both matrices of a role
+/// are k x n EXL3, suh[k] F16, svh[n] F16, trellis [k/16][n/16][16 K] int16.  The blob source and the GPU path
+/// both call this, so the bytes read and the pointers handed to x3::Mat cannot drift.
+Ds41Exl3Layout ds41_exl3_layout(int64_t D, int64_t FF, int k2g, int k2u, int k2d) {
+    Ds41Exl3Layout l;
+    const int k2[3] = {k2g, k2u, k2d};
+    size_t off = 0;
+    for (int r = 0; r < 3; ++r) {
+        const int64_t k = r < 2 ? D : FF, n = r < 2 ? FF : D;
+        l.k2[r] = k2[r];
+        l.suh[r] = off;
+        off += (size_t) k * 2;
+        l.svh[r] = off;
+        off += (size_t) n * 2;
+        off = align256(off);
+        l.trellis[r] = off;
+        off += (size_t) (k / 16) * (size_t) (n / 16) * 16u * (size_t) k2[r];
+        off = align256(off);
+    }
+    l.bytes = off;
+    return l;
+}
+
+}  // namespace
+
 bool ds41_moe_blob_layout(const Ds41MoeGeom& g, cpu::NativeFmt& f, std::string& err) {
     if (g.n_embd <= 0 || g.n_ff <= 0 || g.n_layers <= 0 || g.n_experts <= 0) {
         err = "geometry has a non-positive dimension";
@@ -910,6 +1050,29 @@ bool ds41_moe_blob_layout(const Ds41MoeGeom& g, cpu::NativeFmt& f, std::string& 
     if (g.top_k < 1 || g.top_k > cpu::MAXT) {
         err = "top_k " + std::to_string(g.top_k) + " is outside 1.." + std::to_string((int) cpu::MAXT);
         return false;
+    }
+    if (g.exl3) {   // SAGE's per-expert mixed-K classes: the largest class's blob sizes every buffer
+        if (g.xl_k2_gate.size() != (size_t) g.n_classes() || g.xl_k2_up.size() != (size_t) g.n_classes() ||
+            g.xl_k2_down.size() != (size_t) g.n_classes()) {
+            err = "EXL3 geometry: class bitrate vectors do not match the class count";
+            return false;
+        }
+        bool any = false;
+        for (int64_t c = 0; c < g.n_classes(); ++c) {
+            const Ds41Exl3Layout l = ds41_exl3_layout(g.n_embd, g.n_ff, g.xl_k2_gate[(size_t) c],
+                                                      g.xl_k2_up[(size_t) c], g.xl_k2_down[(size_t) c]);
+            if (!any || l.bytes > f.bytes) {
+                f = cpu::NativeFmt();
+                f.exl3 = true;
+                f.n_embd = g.n_embd;
+                f.n_ff = g.n_ff;
+                f.bytes = l.bytes;
+                f.swiglu_limit = g.swiglu_limit;
+            }
+            any = true;
+        }
+        if (!any) err = "EXL3 geometry with no class";
+        return any;
     }
     if (g.per_expert()) {   // the largest class's layout: what every per-call buffer is sized by
         bool any = false;
@@ -946,6 +1109,21 @@ bool ds41_moe_blob_layout(const Ds41MoeGeom& g, cpu::NativeFmt& f, std::string& 
 
 bool ds41_moe_class_layout(const Ds41MoeGeom& g, int64_t c, cpu::NativeFmt& f, std::string& err) {
     if (!g.per_expert()) return ds41_moe_layer_layout(g, c, f, err);
+    if (g.exl3) {
+        if (c < 0 || c >= g.n_classes()) {
+            err = "EXL3 class " + std::to_string(c) + " out of range";
+            return false;
+        }
+        const Ds41Exl3Layout l = ds41_exl3_layout(g.n_embd, g.n_ff, g.xl_k2_gate[(size_t) c],
+                                                  g.xl_k2_up[(size_t) c], g.xl_k2_down[(size_t) c]);
+        f = cpu::NativeFmt();
+        f.exl3 = true;
+        f.n_embd = g.n_embd;
+        f.n_ff = g.n_ff;
+        f.bytes = l.bytes;
+        f.swiglu_limit = g.swiglu_limit;
+        return true;
+    }
     std::string e;
     const int gu = g.cls_gu[(size_t) c], dt = g.cls_d[(size_t) c];
     if (!cpu::native_fmt3(gu, gu, dt, g.n_embd, g.n_ff, f, e)) {
@@ -1234,9 +1412,16 @@ bool Ds41MemoryBlobs::open(std::string& err) {
 }
 
 void Ds41MemoryBlobs::read(int64_t layer, int64_t expert, uint8_t* dst) const {
+    size_t bytes = blob_;
+    if (g_.exl3 && exl3_fast()) {
+        cpu::NativeFmt f;
+        std::string err;
+        if (!ds41_moe_class_layout(g_, g_.cls(layer, expert), f, err)) std::abort();
+        bytes = f.bytes;
+    }
     const auto it = blobs_.find({layer, expert});
-    if (it != blobs_.end()) std::memcpy(dst, it->second.data(), blob_);
-    else std::memset(dst, 0, blob_);   // see the header: `has()` is the gate's assertion, this is the fallback
+    if (it != blobs_.end()) std::memcpy(dst, it->second.data(), bytes);
+    else std::memset(dst, 0, bytes);   // see the header: `has()` is the gate's assertion, this is the fallback
 }
 
 void Ds41MemoryBlobs::set(int64_t layer, int64_t expert, const uint8_t* blob) {
@@ -1268,6 +1453,18 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     im_->g = geom;
     im_->cfg = cfg;
     im_->blobs = blobs;
+    // slice B: the tier's device and layer range.  device -1 (or cpu_only) = today: the caller's current device,
+    // every OnDevice guard below a no-op that makes no CUDA call.  layer_le 0 = every block of the file.
+    im_->device = cfg.cpu_only ? -1 : cfg.device;
+    im_->lb = cfg.layer_lb;
+    im_->le = cfg.layer_le > 0 ? cfg.layer_le : geom.n_layers;
+    if (cfg.layer_lb > 0 || cfg.layer_le > 0) {   // a split tier serves a contiguous range of the file's blocks
+        if (cfg.layer_lb < 0 || im_->le <= cfg.layer_lb || im_->le > geom.n_layers) {
+            err = "layer range [" + std::to_string(cfg.layer_lb) + ", " + std::to_string(cfg.layer_le) +
+                  ") outside the model's " + std::to_string(geom.n_layers) + " blocks";
+            return false;
+        }
+    }
     if (!ds41_moe_blob_layout(geom, im_->f, err)) return false;
     im_->blob = (int64_t) im_->f.bytes;
     // per-CLASS formats and blob sizes (class = layer unless the geometry is per-expert; all equal to f / blob for a
@@ -1286,10 +1483,14 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
         im_->bl[(size_t) c] = (int64_t) im_->fl[(size_t) c].bytes;
         im_->mixed_sizes = im_->mixed_sizes || im_->bl[(size_t) c] != im_->blob;
     }
-    if (!blobs->open(err)) return false;
+    if (!geom.exl3 && !blobs->open(err)) return false;
     if ((int64_t) blobs->blob_bytes() != im_->blob) {
         err = "blob source is " + std::to_string(blobs->blob_bytes()) + " bytes, the geometry's is " +
               std::to_string(im_->blob);
+        return false;
+    }
+    if (geom.exl3 && cfg.cpu_only) {
+        err = "EXL3 experts need the CUDA tier (cfg.cpu_only is set)";
         return false;
     }
     im_->pool.reset(new cpu::ExpertPool(cfg.threads > 0 ? cfg.threads : 0));
@@ -1302,6 +1503,7 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     im_->nact_multi_act.clear();
     for (int64_t c = 0; c < NCL; ++c) {
         if (!geom.per_expert() && !geom.routed(c)) continue;
+        if (im_->fl[(size_t) c].exl3) continue;
         const int a = im_->fl[(size_t) c].gu_act;
         if (std::find(im_->nact_multi_act.begin(), im_->nact_multi_act.end(), a) == im_->nact_multi_act.end())
             im_->nact_multi_act.push_back(a);
@@ -1320,32 +1522,51 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     return false;
 #else
     Gpu& gp = *(im_->gpu = std::unique_ptr<Gpu>(new Gpu()));
+    // slice B: with cfg.device set, every stream, event, buffer and cache slot below is created on THAT device,
+    // not on whatever the calling thread happens to have current.  device -1: OnDevice makes no CUDA call.
+    const strata::core::OnDevice on_dev(im_->device);
+    gp.device = im_->device;
     gp.arena.blob = im_->blob;
     gp.arena.n_layers = geom.n_layers;
     gp.arena.n_experts = geom.n_experts;
-    gp.gl = strata::kernels::native_expert_layout(geom.gu_type, geom.d_type, geom.n_embd, geom.n_ff);
-    gp.gl.swiglu_limit = geom.swiglu_limit;
-    gp.gll.assign((size_t) NCL, gp.gl);
-    for (int64_t l = 0; l < NCL; ++l) {   // l = a class (= the layer unless per-expert)
-        if (!geom.per_expert() && !geom.routed(l)) continue;
-        const int gt = geom.per_expert() ? geom.cls_gu[(size_t) l] : geom.gate_type(l);
-        const int ut = geom.per_expert() ? gt : geom.up_type(l);
-        const int dt = geom.per_expert() ? geom.cls_d[(size_t) l] : geom.down_type(l);
-        if (!strata::kernels::native_expert_supported3(gt, ut, dt, geom.n_embd, geom.n_ff)) {
-            err = "native_expert_grouped has no kernel for layer " + std::to_string(l) + "'s types " +
-                  std::to_string(gt) + "/" + std::to_string(ut) + "/" + std::to_string(dt);
-            return false;
+    if (geom.exl3) {
+        gp.gl.bytes = (size_t) im_->blob;
+        gp.gl.n_embd = geom.n_embd;
+        gp.gl.n_ff = geom.n_ff;
+        gp.gl.swiglu_limit = geom.swiglu_limit;
+        gp.gll.assign((size_t) NCL, gp.gl);
+        for (int64_t c = 0; c < NCL; ++c) {
+            gp.gll[(size_t) c].bytes = (size_t) im_->bl[(size_t) c];
         }
-        strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout3(gt, ut, dt, geom.n_embd, geom.n_ff);
-        L.swiglu_limit = geom.swiglu_limit;
-        if ((int64_t) L.bytes != im_->bl[(size_t) l]) {
-            err = "layer " + std::to_string(l) + ": GPU blob " + std::to_string(L.bytes) + " != CPU blob " +
-                  std::to_string(im_->bl[(size_t) l]);
-            return false;
+    } else {
+        gp.gl = strata::kernels::native_expert_layout(geom.gu_type, geom.d_type, geom.n_embd, geom.n_ff);
+        gp.gl.swiglu_limit = geom.swiglu_limit;
+        gp.gll.assign((size_t) NCL, gp.gl);
+        for (int64_t l = 0; l < NCL; ++l) {   // l = a class (= the layer unless per-expert)
+            if (!geom.per_expert() && !geom.routed(l)) continue;
+            const int gt = geom.per_expert() ? geom.cls_gu[(size_t) l] : geom.gate_type(l);
+            const int ut = geom.per_expert() ? gt : geom.up_type(l);
+            const int dt = geom.per_expert() ? geom.cls_d[(size_t) l] : geom.down_type(l);
+            if (!strata::kernels::native_expert_supported3(gt, ut, dt, geom.n_embd, geom.n_ff)) {
+                err = "native_expert_grouped has no kernel for layer " + std::to_string(l) + "'s types " +
+                      std::to_string(gt) + "/" + std::to_string(ut) + "/" + std::to_string(dt);
+                return false;
+            }
+            strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout3(gt, ut, dt, geom.n_embd, geom.n_ff);
+            L.swiglu_limit = geom.swiglu_limit;
+            if ((int64_t) L.bytes != im_->bl[(size_t) l]) {
+                err = "layer " + std::to_string(l) + ": GPU blob " + std::to_string(L.bytes) + " != CPU blob " +
+                      std::to_string(im_->bl[(size_t) l]);
+                return false;
+            }
+            gp.gll[(size_t) l] = L;
         }
-        gp.gll[(size_t) l] = L;
     }
     ck(cudaStreamCreate(&gp.s), "stream");
+    if (geom.exl3 && !strata::kernels::exl3::prepare(gp.s)) {
+        err = "EXL3: prepare() failed on the tier stream";
+        return false;
+    }
     const size_t H4 = (size_t) geom.n_embd * 4;
     ck(cudaMalloc(&gp.d_x, (size_t) kMaxTok * H4), "d_x");
     ck(cudaMalloc(&gp.d_xq, strata::kernels::native_q8_1_bytes((int) geom.n_embd, kMaxTok)), "d_xq");
@@ -1357,6 +1578,22 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     ck(cudaMalloc(&gp.d_ent_tok, sizeof(int32_t) * kMaxEnt), "d_ent_tok");
     ck(cudaMalloc(&gp.d_scratch, strata::kernels::native_expert_scratch_bytes(kMaxEnt, geom.n_ff)), "d_scratch");
     ck(cudaMalloc(&gp.d_stage, (size_t) kMaxParts * (size_t) im_->blob), "d_stage");
+    if (geom.exl3) {
+        const size_t FF4 = (size_t) kMaxParts * (size_t) geom.n_ff * 4;
+        ck(cudaMalloc(&gp.d_exl3_gate, FF4), "exl3 gate");
+        ck(cudaMalloc(&gp.d_exl3_up, FF4), "exl3 up");
+        ck(cudaMalloc(&gp.d_exl3_h, FF4), "exl3 h");
+        ck(cudaMalloc(&gp.d_exl3_w, sizeof(float) * kMaxParts), "exl3 w");
+        ck(cudaMalloc(&gp.d_exl3_out, H4), "exl3 out");
+        const size_t X4 = (size_t) x3::kMaxMvCols * (size_t) std::max<int64_t>(geom.n_embd, geom.n_ff) * 4;
+        ck(cudaMalloc(&gp.d_exl3_xg, X4), "exl3 chunk x");
+        ck(cudaMalloc(&gp.d_exl3_gb, X4), "exl3 chunk gate");
+        ck(cudaMalloc(&gp.d_exl3_ub, X4), "exl3 chunk up");
+        ck(cudaMalloc(&gp.d_exl3_hb, X4), "exl3 chunk h");
+        ck(cudaMalloc(&gp.d_exl3_pb, X4), "exl3 chunk part");
+        ck(cudaMalloc(&gp.d_exl3_ptok, sizeof(int32_t) * x3::kMaxMvCols), "exl3 chunk tokens");
+        ck(cudaMalloc(&gp.d_exl3_pw, sizeof(float) * x3::kMaxMvCols), "exl3 chunk weights");
+    }
     for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&gp.ev[i]), "event");
     ck(cudaMallocHost((void**) &gp.h_x, (size_t) kMaxTok * H4), "h_x");
     ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
@@ -1377,10 +1614,17 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
         std::memset(gp.h_dummy, 0, (size_t) im_->blob);
     }
     // a geometry whose blob size varies per layer opens its cache at the seed, sized to the ranked experts
+    // slot_gib caps the count the same way the seed's budget does (below): cfg.slots defaults to n_layers *
+    // n_experts, which for a uniform-blob model asks for the whole model in VRAM (15360 x 9.1 MB = 130.52 GiB on
+    // an 11.34 GiB card) and init fails outright.  slot_gib = 0 (--slots given) keeps today's count.
     if (!cfg.no_cache && cfg.slots > 0 && !im_->mixed_sizes && !cfg.defer_cache) {   // defer_cache: opened at the seed
-        std::vector<int64_t> sizes((size_t) cfg.slots, im_->blob);
-        gp.cache.reset(new strata::core::ExpertCache());
-        if (!gp.cache->open_sized(sizes, geom.n_layers, geom.n_experts, err)) return false;
+        const int64_t cap = cfg.slot_gib > 0 ? (int64_t) (cfg.slot_gib * 1073741824.0 / (double) im_->blob) : cfg.slots;
+        const int64_t nsl = std::min(cap, cfg.slots);
+        if (nsl > 0) {   // not even one slot fits: no cache, same as the seed's empty-sizes guard
+            std::vector<int64_t> sizes((size_t) nsl, im_->blob);
+            gp.cache.reset(new strata::core::ExpertCache());
+            if (!gp.cache->open_sized(sizes, geom.n_layers, geom.n_experts, err)) return false;
+        }
     }
     // NO ARENA HERE.  The arena is 52-73 GiB of the real model and it is ORDERED (build_arena): building it twice -
     // once in index order here, once from the profile when the caller seeds - would read the file twice and page
@@ -1402,7 +1646,7 @@ std::vector<std::pair<int32_t, int32_t>> arena_order(const Ds41MoeImpl& im, cons
     int64_t n = 0;
     for (const auto& le : ranked) {
         if (n >= im.cfg.slots) break;
-        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
+        if (!im.g.routed(le.first) || out_of_range(im, le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
         char& r = res[(size_t) (le.first * im.g.n_experts + le.second)];
         if (r) continue;
         const int64_t b = im.bl[(size_t) im.g.cls(le.first, le.second)];
@@ -1414,7 +1658,7 @@ std::vector<std::pair<int32_t, int32_t>> arena_order(const Ds41MoeImpl& im, cons
     std::vector<std::pair<int32_t, int32_t>> rest;
     rest.reserve(ranked.size());
     for (const auto& le : ranked)
-        if (le.first < 0 || le.first >= im.g.n_layers || le.second < 0 || le.second >= im.g.n_experts ||
+        if (le.second < 0 || le.second >= im.g.n_experts || out_of_range(im, le.first) ||
             !res[(size_t) (le.first * im.g.n_experts + le.second)])
             rest.push_back(le);
     return rest;
@@ -1426,6 +1670,7 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     (void) err;
     return true;   // no arena in a CPU-only tier: every blob comes from the source
 #else
+    const strata::core::OnDevice on_dev(im_->device);   // the pinned arena registers against the tier's context
     if (!im_->gpu || im_->cfg.cpu_only) return true;
     Gpu& gp = *im_->gpu;
     const int64_t total = im_->g.n_layers * im_->g.n_experts;
@@ -1445,7 +1690,7 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     std::vector<std::pair<int32_t, int32_t>> order = ranked;
     if (order.empty()) {
         order.reserve((size_t) total);
-        for (int64_t l = 0; l < im_->g.n_layers; ++l)
+        for (int64_t l = im_->lb; l < im_->le; ++l)   // slice B: a split tier's default order is its own layers
             for (int64_t e = 0; e < im_->g.n_experts; ++e)
                 if (im_->g.routed(l)) order.push_back({(int32_t) l, (int32_t) e});
     }
@@ -1455,10 +1700,12 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     first.reserve(order.size());
     for (const auto& le : order) {
         const int64_t l = le.first, e = le.second;
-        if (l < 0 || l >= im_->g.n_layers || e < 0 || e >= im_->g.n_experts) continue;
+        if (l < im_->lb || l >= im_->le || e < 0 || e >= im_->g.n_experts) continue;   // slice B: [lb, le) only
         if (!im_->g.routed(l)) continue;
         if (gp.arena.slot_of[(size_t) (l * im_->g.n_experts + e)] >= 0) continue;
-        const uint64_t b = (uint64_t) im_->bl[(size_t) im_->g.cls(l, e)];
+        // The legacy reader pads to blob_bytes(); fast EXL3 reads only its class, so those slots pack tightly.
+        const uint64_t b = (uint64_t) (im_->mixed_sizes && !(im_->g.exl3 && exl3_fast())
+                                         ? im_->blob : im_->bl[(size_t) im_->g.cls(l, e)]);
         if (gp.arena.off.back() + b > cap_bytes) {   // the budget in BYTES: blobs differ per layer (MiMo)
             ++gp.arena.file_tier;
             continue;
@@ -1569,7 +1816,7 @@ std::vector<std::pair<int32_t, int32_t>> warm_first(Ds41MoeImpl& im, const std::
     int64_t n = 0;
     for (const auto& le : im.warm) {
         if (n >= take) break;
-        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
+        if (!im.g.routed(le.first) || out_of_range(im, le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
         char& sn = seen[(size_t) (le.first * im.g.n_experts + le.second)];
         if (sn) continue;
         sn = 1;
@@ -1578,7 +1825,7 @@ std::vector<std::pair<int32_t, int32_t>> warm_first(Ds41MoeImpl& im, const std::
     }
     im.warm.clear();
     for (const auto& le : ranked) {
-        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
+        if (!im.g.routed(le.first) || out_of_range(im, le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
         char& sn = seen[(size_t) (le.first * im.g.n_experts + le.second)];
         if (sn) continue;
         sn = 1;
@@ -1608,13 +1855,18 @@ void Ds41MoeTier::set_cache_enabled(bool on) {
 
 bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
-    const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
+    std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
+    if (im_->cfg.layer_lb > 0 || im_->cfg.layer_le > 0)   // slice B: the profile is global; this seed takes its layers
+        ranked.erase(std::remove_if(ranked.begin(), ranked.end(),
+                                   [&](const std::pair<int32_t, int32_t>& le) { return out_of_range(*im_, le.first); }),
+                     ranked.end());
     if (!build_arena(arena_order(*im_, ranked), err)) return false;
 #if !defined(DS4_MOE_CUDA)
     (void) ranked;
     err = "the VRAM cache needs the CUDA tier (compiled without DS4_MOE_CUDA)";
     return false;
 #else
+    const strata::core::OnDevice on_dev(im_->device);   // the cache opens, fills and its stream-0 sync run on cfg.device
     // A per-layer-sized geometry (MiMo) opens its cache now: one slot per ranked expert, each the size of ITS
     // layer's blob, until `slots` experts or `slot_gib` bytes.  The seed below admits in the same order, so slot i
     // is ranked[i]'s and fits it exactly; the cache never evicts, so a slot never meets another layer's blob.
@@ -1644,10 +1896,15 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
     // uniform blobs with defer_cache: the cache opens now (after the prompt chunks gave their VRAM back)
     if (!im_->mixed_sizes && im_->cfg.defer_cache && im_->gpu && !im_->gpu->cache && !im_->cfg.no_cache &&
         im_->cfg.slots > 0) {
-        std::vector<int64_t> sizes((size_t) im_->cfg.slots, im_->blob);
-        im_->gpu->cache.reset(new strata::core::ExpertCache());
-        if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes((int64_t) 64 << 20);
-        if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
+        const int64_t cap = im_->cfg.slot_gib > 0
+                                ? (int64_t) (im_->cfg.slot_gib * 1073741824.0 / (double) im_->blob) : im_->cfg.slots;
+        const int64_t nsl = std::min(cap, im_->cfg.slots);   // same cap as the init-time open above
+        if (nsl > 0) {
+            std::vector<int64_t> sizes((size_t) nsl, im_->blob);
+            im_->gpu->cache.reset(new strata::core::ExpertCache());
+            if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes((int64_t) 64 << 20);
+            if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
+        }
     }
     if (!im_->gpu || !im_->gpu->cache) return true;   // no cache: nothing to seed
     const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots());
@@ -1698,6 +1955,8 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         const int nth = (int) std::min<size_t>(8, fjobs.size());
         for (int k = 0; k < nth; ++k)
             th.emplace_back([&]() {
+                const strata::core::OnDevice on_dev(im_->device);   // a worker thread has no current device: pin the
+                                                                    // buffer for, and run the fill's copy on, the tier's
                 uint8_t* buf = nullptr;
                 if (cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) {
                     bad = true;
@@ -1750,7 +2009,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
 }
 
 void Ds41MoeTier::advise_file(int64_t layer, const int32_t* ids, int n) {
-    if (!im_->inited || !im_->blobs || !ids || n <= 0 || layer < 0 || layer >= im_->g.n_layers || !im_->g.routed(layer)) return;
+    if (!im_->inited || !im_->blobs || !ids || n <= 0 || layer < 0 || layer >= im_->g.n_layers || out_of_range(*im_, layer) || !im_->g.routed(layer)) return;
     for (int i = 0; i < n; ++i) {
         const int32_t e = ids[i];
         if (e < 0 || e >= im_->g.n_experts || resident(layer, e) || in_arena(layer, e)) continue;
@@ -1789,7 +2048,8 @@ void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
     // d3: the caller is the verify pass, whose FILEG path takes stashed blobs under arena_adapt too (gpu_run's
     // arena_adapt path reads into arena slots and never looks at the stash)
     if (!im.inited || !im.gpu || !im.blobs || im.cfg.cpu_only || (im.cfg.arena_adapt && !d3) || !ids || n <= 0) return;
-    if (layer <= im.run_layer || layer >= im.g.n_layers || !im.g.routed(layer)) return;
+    if (layer <= im.run_layer || layer >= im.g.n_layers || out_of_range(im, layer) || !im.g.routed(layer)) return;
+    const strata::core::OnDevice on_dev(im.device);   // the stash's pinned buffer is DMA'd by the tier's card
     Gpu& gp = *im.gpu;
     if (!gp.spec) {
         gp.spec = std::make_unique<SpecStash>();
@@ -1809,8 +2069,9 @@ void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
 void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int max_slots) {
     im_->pf_n = 0;
 #if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // the prefetch DMAs run on the tier's stream, on its card
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.no_cache || !im_->gpu->cache) return;
-    if (!ids || n <= 0 || max_slots <= 0 || !im_->g.routed(layer)) return;
+    if (!ids || n <= 0 || max_slots <= 0 || !im_->g.routed(layer) || out_of_range(*im_, layer)) return;
     Gpu& gp = *im_->gpu;
     if (!gp.s_pf || !gp.d_pf) return;   // allocated with pf_b > 0 (the decode default)
     const int nb = std::min(max_slots, (int) Ds41MoeConfig::kMaxPf);
@@ -1837,8 +2098,9 @@ void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int m
 void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
     im_->pf_n = 0;
 #if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // the prefetch DMAs run on the tier's stream, on its card
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.pf_b <= 0 || im_->cfg.no_cache || !im_->gpu->cache) return;
-    if (!top16 || n <= 0 || !im_->g.routed(layer)) return;
+    if (!top16 || n <= 0 || !im_->g.routed(layer) || out_of_range(*im_, layer)) return;
     Gpu& gp = *im_->gpu;
     n = std::min(n, (int) Ds41MoeConfig::kPredW);
     int nb;
@@ -1868,7 +2130,7 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
         // tokens are unchanged) - the zero blob only kept the replay's timing, and it shares the H2D engine with the
         // demand misses
         static const bool no_dummy = std::getenv("STRATA_PF_NO_DUMMY") && std::getenv("STRATA_PF_NO_DUMMY")[0] == '1';
-        if (!(dummy && no_dummy))
+        if (!(dummy && (no_dummy || (im_->g.exl3 && exl3_fast()))))
             ck(cudaMemcpyAsync((uint8_t*) gp.d_pf + (size_t) im_->pf_n * (size_t) im_->blob, src,
                                (size_t) im_->bl[(size_t) im_->g.cls(layer, e)], cudaMemcpyHostToDevice, gp.s_pf), "prefetch dma");
         // A dummy slot holds ZEROS, not the expert: it must never be matched by run() (found by
@@ -2009,6 +2271,7 @@ bool cpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
 /// geometry has no fixed class set or CUDA refuses any part of the capture.
 constexpr int kTierGraphGroups = 1;   ///< the fixed group rows per class (the kernels stride the real ng themselves)
 static bool tier_graph_capture(Gpu& gp) {
+    const strata::core::OnDevice on_dev(gp.device);   // the capture stream and the graphs belong to the tier's card
     const int ncls = (int) gp.gll.size();
     const size_t slot = meta_off(0, kMaxParts).end;
     const size_t span = (size_t) ncls * slot;
@@ -2115,8 +2378,396 @@ int32_t arena_victim(Ds41MoeImpl& im, int64_t layer, uint64_t need, const int32_
     return victim;
 }
 
+/// The EXL3 expert path: one layer's top-k from VRAM, the RAM arena, or the file, with x3::mv for each role.  The
+/// pack mixes K per expert AND per role (820 of SAGE's 15,360 experts have K(gate) != K(up)), which is exactly what
+/// mv's per-job Mat takes; moe_gate_up would refuse those because it carries one ExpertLayout for both.  The three
+/// role GEMVs are batched (six jobs each), the SwiGLU is a tiny local kernel, and decode_rows_sum keeps the tier's
+/// top-k order/arithmetic (double accumulation, weights in order).
+bool gpu_run_exl3(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
+                  const void* x_dev, float* out, void* out_dev) {
+    const strata::core::OnDevice on_dev(im.device);
+    Gpu& gp = *im.gpu;
+    const int64_t H = im.g.n_embd, FF = im.g.n_ff, K = im.g.top_k, B = im.blob;
+    const double t0 = now_ms();
+    if (!ids6 || !w6 || (!x_host && !x_dev) || (!out && !out_dev)) return false;
+    if (gp.d_exl3_gate == nullptr) return false;
+    const float* xd = nullptr;
+    if (x_dev) xd = (const float*) x_dev;
+    else {
+        ck(cudaMemcpyAsync(gp.d_x, x_host, (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "exl3 x h2d");
+        xd = (const float*) gp.d_x;
+    }
+    ck(cudaMemcpyAsync(gp.d_exl3_w, w6, (size_t) K * 4, cudaMemcpyHostToDevice, gp.s), "exl3 w h2d");
+
+    x3::Mat gm[kMaxParts], um[kMaxParts], dm[kMaxParts];
+    x3::MvJob gj[kMaxParts], uj[kMaxParts], dj[kMaxParts];
+    int ng = 0, nu = 0, nd = 0;
+    Ds41MoeStats st;
+    const uint8_t* prefetched[kMaxParts] = {};
+    if (exl3_fast()) {
+        ++im.run_seq;
+        im.run_layer = layer;
+        std::vector<int> files;
+        for (int j = 0; j < K; ++j) {
+            const int e = ids6[j];
+            if (e < 0 || e >= im.g.n_experts) return false;
+            if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
+            for (int p = 0; p < im.pf_n; ++p)
+                if (im.pf_e[p] == e) prefetched[j] = (const uint8_t*) gp.d_pf + (size_t) p * B;
+            if (!prefetched[j] && !gp.arena.ptr(layer, e)) files.push_back(j);
+        }
+        if (im.pf_n) ck(cudaStreamWaitEvent(gp.s, gp.ev_pf, 0), "exl3 wait prefetch");
+        if (!files.empty()) {
+            const double read0 = now_ms();
+            if (!gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * B), "h_fstage");
+            if (!gp.rpool) gp.rpool.reset(new ReadPool());
+            gp.rpool->start(files.size() * 4, [&](size_t task) {
+                const int j = files[task / 4];
+                im.blobs->read_part(layer, ids6[j], (int) (task % 4), 4, gp.h_fstage + (size_t) j * B);
+            });
+            gp.rpool->wait();
+            st.file_ms += now_ms() - read0;
+        }
+    }
+    for (int64_t j = 0; j < K; ++j) {
+        const int32_t e = ids6[j];
+        if (e < 0 || e >= im.g.n_experts) return false;
+        const int c = im.g.cls(layer, e);
+        if (c < 0 || c >= (int) im.g.xl_k2_gate.size()) return false;
+        const Ds41Exl3Layout L = ds41_exl3_layout(H, FF, im.g.xl_k2_gate[(size_t) c], im.g.xl_k2_up[(size_t) c],
+                                                  im.g.xl_k2_down[(size_t) c]);
+        const uint8_t* dev = nullptr;
+        if (gp.cache && !im.cfg.no_cache) {
+            const int32_t slot = gp.cache->slot_of(layer, e);
+            if (slot >= 0) { dev = gp.cache->device_slot(slot); ++st.hits; }
+        }
+        if (!dev && prefetched[j]) {
+            dev = prefetched[j];
+            ++st.prefetched_useful;
+            ++st.hits;
+        }
+        if (!dev) {
+            if (const uint8_t* p = gp.arena.ptr(layer, e)) {
+                dev = (const uint8_t*) gp.d_stage + (size_t) j * (size_t) B;
+                ck(cudaMemcpyAsync((void*) dev, p, L.bytes, cudaMemcpyHostToDevice, gp.s), "exl3 arena h2d");
+                ++st.pcie;
+            } else {
+                if (!gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * (size_t) B), "h_fstage");
+                uint8_t* hp = gp.h_fstage + (size_t) j * (size_t) B;
+                if (!exl3_fast()) im.blobs->read(layer, e, hp);
+                dev = (const uint8_t*) gp.d_stage + (size_t) j * (size_t) B;
+                ck(cudaMemcpyAsync((void*) dev, hp, L.bytes, cudaMemcpyHostToDevice, gp.s), "exl3 file h2d");
+                ++st.file_tier;
+            }
+        }
+        const int64_t dims[3][2] = {{H, FF}, {H, FF}, {FF, H}};
+        x3::Mat* mats[3] = {&gm[ng], &um[nu], &dm[nd]};
+        for (int r = 0; r < 3; ++r) {
+            x3::Mat& m = *mats[r];
+            m = x3::Mat();
+            m.trellis = (const uint32_t*) (dev + L.trellis[r]);
+            m.suh = (const uint16_t*) (dev + L.suh[r]);
+            m.svh = (const uint16_t*) (dev + L.svh[r]);
+            m.k = (int) dims[r][0];
+            m.n = (int) dims[r][1];
+            m.k2 = L.k2[r];
+            m.cb = 2;
+            m.ld = 0;
+        }
+        gj[ng].m = &gm[ng];
+        gj[ng].xf = xd;
+        gj[ng].y = (float*) gp.d_exl3_gate + (size_t) j * (size_t) FF;
+        ++ng;
+        uj[nu].m = &um[nu];
+        uj[nu].xf = xd;
+        uj[nu].y = (float*) gp.d_exl3_up + (size_t) j * (size_t) FF;
+        ++nu;
+        dj[nd].m = &dm[nd];
+        dj[nd].xf = (const float*) gp.d_exl3_h + (size_t) j * (size_t) FF;
+        dj[nd].y = (float*) gp.d_parts + (size_t) j * (size_t) H;
+        ++nd;
+    }
+    if (!x3::mv(gj, ng, gp.s) || !x3::mv(uj, nu, gp.s)) return false;
+    ds41_exl3_swiglu((const float*) gp.d_exl3_gate, (const float*) gp.d_exl3_up, (float*) gp.d_exl3_h,
+                     K * FF, im.g.swiglu_limit, gp.s);
+    if (!x3::mv(dj, nd, gp.s)) return false;
+    float* yd = out_dev ? (float*) out_dev : (float*) gp.d_exl3_out;
+    strata::kernels::decode_rows_sum((const float*) gp.d_parts, (const float*) gp.d_exl3_w, (int) K, H, yd, gp.s);
+    if (!out_dev)
+        ck(cudaMemcpyAsync(out, gp.d_exl3_out, (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "exl3 out d2h");
+    ck(cudaStreamSynchronize(gp.s), "exl3 sync");
+    if (exl3_fast()) im.pf_n = 0;
+    st.wall_ms = now_ms() - t0;
+    im.st.add(st);
+    return true;
+}
+
+bool gpu_run_exl3_batch(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x,
+                       float* out, void* out_dev) {
+    const strata::core::OnDevice on_dev(im.device);
+    Gpu& gp = *im.gpu;
+    Exl3Chunk& q = gp.xl_chunk;
+    im.pf_n = 0;
+    const int H = (int) im.g.n_embd, FF = (int) im.g.n_ff, K = (int) im.g.top_k, NX = (int) im.g.n_experts;
+    const size_t B = (size_t) im.blob;
+    const double t0 = now_ms();
+    Ds41MoeStats st;
+    std::vector<int> counts(NX, 0), starts(NX + 1, 0), pairs((size_t) n * K);
+    for (int i = 0; i < n * K; ++i) {
+        if (ids[i] < 0 || ids[i] >= NX) return false;
+        ++counts[ids[i]];
+    }
+    for (int e = 0; e < NX; ++e) starts[e + 1] = starts[e] + counts[e];
+    std::vector<int> at(starts.begin(), starts.end() - 1);
+    for (int i = 0; i < n * K; ++i) pairs[at[ids[i]]++] = i;
+    std::vector<int> order((size_t) n * K);
+    for (int t = 0; t < n; ++t) {
+        for (int k = 0; k < K; ++k) order[t * K + k] = t * K + k;
+        std::stable_sort(order.begin() + t * K, order.begin() + (t + 1) * K,
+                         [&](int a, int b) { return ids[a] < ids[b]; });
+    }
+    q.open(n, *std::max_element(counts.begin(), counts.end()), H, FF, K, B, gp.s);
+    ck(cudaMemcpyAsync(q.x, x, (size_t) n * H * 4, cudaMemcpyHostToDevice, gp.s), "exl3 batch input");
+    ck(cudaMemcpyAsync(q.pairs, pairs.data(), pairs.size() * 4, cudaMemcpyHostToDevice, gp.s), "exl3 batch pairs");
+    ck(cudaMemcpyAsync(q.order, order.data(), order.size() * 4, cudaMemcpyHostToDevice, gp.s), "exl3 sum order");
+    ck(cudaMemcpyAsync(q.weights, w, (size_t) n * K * 4, cudaMemcpyHostToDevice, gp.s), "exl3 batch weights");
+
+    struct Expert { int e, start, count; Ds41Exl3Layout layout; const uint8_t *host = nullptr, *dev = nullptr; };
+    std::vector<Expert> experts;
+    for (int e = 0; e < NX; ++e) {
+        if (!counts[e]) continue;
+        const int c = im.g.cls(layer, e);
+        Expert a{e, starts[e], counts[e], ds41_exl3_layout(H, FF, im.g.xl_k2_gate[c], im.g.xl_k2_up[c], im.g.xl_k2_down[c])};
+        if (gp.cache && !im.cfg.no_cache) {
+            const int slot = gp.cache->slot_of(layer, e);
+            if (slot >= 0) { a.dev = gp.cache->device_slot(slot); ++st.hits; }
+        }
+        if (!a.dev) {
+            a.host = gp.arena.ptr(layer, e);
+            if (a.host) ++st.pcie;
+            else ++st.file_tier;
+        }
+        experts.push_back(a);
+    }
+    const int nt = ((int) experts.size() + Exl3Chunk::batch - 1) / Exl3Chunk::batch;
+    if (!gp.rpool) gp.rpool.reset(new ReadPool());
+    auto read_tile = [&](int t) {
+        if (t >= nt) return;
+        const int h = t % 2, begin = t * Exl3Chunk::batch;
+        if (t >= 2) ck(cudaEventSynchronize(q.copied[h]), "exl3 reader reuse");
+        std::vector<int> jobs;
+        for (int i = begin; i < std::min(begin + Exl3Chunk::batch, (int) experts.size()); ++i)
+            if (!experts[i].dev && !experts[i].host) jobs.push_back(i);
+        gp.rpool->start(jobs.size() * 4, [&, jobs, h, begin](size_t task) {
+            const int i = jobs[task / 4];
+            im.blobs->read_part(layer, experts[i].e, (int) (task % 4), 4, q.host[h] + (size_t) (i - begin) * B);
+        });
+    };
+    read_tile(0);
+    auto refused = [&]() {
+        gp.rpool->wait();
+        cudaStreamSynchronize(q.copy);
+        cudaStreamSynchronize(gp.s);
+        return false;
+    };
+    for (int t = 0; t < nt; ++t) {
+        const double wait0 = now_ms();
+        gp.rpool->wait();
+        st.file_ms += now_ms() - wait0;
+        const int h = t % 2, begin = t * Exl3Chunk::batch;
+        const int end = std::min(begin + Exl3Chunk::batch, (int) experts.size());
+        if (t >= 2) ck(cudaStreamWaitEvent(q.copy, q.used[h], 0), "exl3 stage reuse");
+        for (int i = begin; i < end; ++i) {
+            Expert& a = experts[i];
+            if (a.dev) continue;
+            const uint8_t* src = a.host ? a.host : q.host[h] + (size_t) (i - begin) * B;
+            a.dev = (const uint8_t*) q.stage[h] + (size_t) (i - begin) * B;
+            ck(cudaMemcpyAsync((void*) a.dev, src, a.layout.bytes, cudaMemcpyHostToDevice, q.copy), "exl3 staged expert");
+        }
+        ck(cudaEventRecord(q.copied[h], q.copy), "exl3 staged ready");
+        read_tile(t + 1);
+        ck(cudaStreamWaitEvent(gp.s, q.copied[h], 0), "exl3 compute wait");
+        for (int i = begin; i < end; ++i) {
+            const Expert& a = experts[i];
+            const int* indices = (const int*) q.pairs + a.start;
+            ds41_exl3_gather((const float*) q.x, indices, K, a.count, H, (float*) q.gather, gp.s);
+            x3::Mat mat[3];
+            for (int r = 0; r < 3; ++r) {
+                mat[r].trellis = (const uint32_t*) (a.dev + a.layout.trellis[r]);
+                mat[r].suh = (const uint16_t*) (a.dev + a.layout.suh[r]);
+                mat[r].svh = (const uint16_t*) (a.dev + a.layout.svh[r]);
+                mat[r].k = r < 2 ? H : FF;
+                mat[r].n = r < 2 ? FF : H;
+                mat[r].k2 = a.layout.k2[r];
+                mat[r].cb = 2;
+            }
+            {
+                int mc = x3::kMaxMvCols;
+                for (const x3::Mat& m : mat) mc = std::min(mc, std::max(1, x3::mv_cols(m)));
+                for (int row = 0; row < a.count; row += mc) {
+                    const int b = std::min(mc, a.count - row);
+                    x3::MvJob gu[2];
+                    for (int r = 0; r < 2; ++r) {
+                        gu[r].m = &mat[r]; gu[r].xf = (const float*) q.gather + (size_t) row * H;
+                        gu[r].y = (float*) (r == 0 ? q.gate : q.up) + (size_t) row * FF;
+                        gu[r].ncol = b; gu[r].xf_cs = H; gu[r].y_cs = FF;
+                    }
+                    if (!x3::mv(gu, 2, gp.s)) return refused();
+                }
+                ds41_exl3_swiglu((const float*) q.gate, (const float*) q.up, (float*) q.hidden,
+                                 (long long) a.count * FF, im.g.swiglu_limit, gp.s);
+                for (int row = 0; row < a.count; row += mc) {
+                    x3::MvJob down;
+                    down.m = &mat[2]; down.xf = (const float*) q.hidden + (size_t) row * FF;
+                    down.y = (float*) q.product + (size_t) row * H;
+                    down.ncol = std::min(mc, a.count - row); down.xf_cs = FF; down.y_cs = H;
+                    if (!x3::mv(&down, 1, gp.s)) return refused();
+                }
+            }
+            ds41_exl3_scatter((const float*) q.product, indices, a.count, H, (float*) q.parts, gp.s);
+        }
+        ck(cudaEventRecord(q.used[h], gp.s), "exl3 compute done");
+    }
+    float* yd = out_dev ? (float*) out_dev : (float*) q.out;
+    ds41_exl3_sum((const float*) q.parts, (const float*) q.weights, (const int*) q.order, n, K, H, yd, gp.s);
+    if (!out_dev) ck(cudaMemcpyAsync(out, yd, (size_t) n * H * 4, cudaMemcpyDeviceToHost, gp.s), "exl3 batch output");
+    ck(cudaStreamSynchronize(gp.s), "exl3 batch sync");
+    st.wall_ms = now_ms() - t0;
+    im.st.add(st);
+    return true;
+}
+
+bool gpu_run_exl3_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x,
+                        float* out, void* out_dev) {
+    const strata::core::OnDevice on_dev(im.device);
+    Gpu& gp = *im.gpu;
+    if (gp.d_exl3_gate == nullptr || n < 1 || !ids || !w || !x || (!out && !out_dev)) return false;
+    if (exl3_fast()) return gpu_run_exl3_batch(im, layer, n, ids, w, x, out, out_dev);
+    const int64_t H = im.g.n_embd, FF = im.g.n_ff, K = im.g.top_k, B = im.blob, NX = im.g.n_experts;
+    const int MC = x3::kMaxMvCols;
+    const double t0 = now_ms();
+    Ds41MoeStats st;
+
+    std::vector<int32_t> cnt((size_t) NX, 0), start((size_t) NX + 1, 0), pairs((size_t) n * (size_t) K, 0);
+    for (int64_t i = 0; i < (int64_t) n * K; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= NX) return false;
+        ++cnt[(size_t) e];
+    }
+    for (int64_t e = 0; e < NX; ++e) start[(size_t) e + 1] = start[(size_t) e] + cnt[(size_t) e];
+    std::vector<int32_t> at(start.begin(), start.end() - 1);
+    for (int64_t i = 0; i < (int64_t) n * K; ++i) pairs[(size_t) at[(size_t) ids[i]]++] = (int32_t) i;
+
+    float* od = out_dev ? (float*) out_dev : (float*) gp.d_exl3_ob;
+    if (!out_dev) {
+        if (n > gp.xl_ob_tok) {
+            if (gp.d_exl3_ob) cudaFree(gp.d_exl3_ob);
+            gp.d_exl3_ob = nullptr;
+            gp.xl_ob_tok = 0;
+            ck(cudaMalloc(&gp.d_exl3_ob, (size_t) n * (size_t) H * 4), "exl3 chunk out");
+            gp.xl_ob_tok = n;
+        }
+        od = (float*) gp.d_exl3_ob;
+    }
+    ck(cudaMemsetAsync(od, 0, (size_t) n * (size_t) H * 4, gp.s), "exl3 chunk memset");
+
+    x3::Mat gm, um, dm;
+    x3::MvJob gj[2] = {}, dj[1] = {};
+    int32_t htok[x3::kMaxMvCols];
+    float hw[x3::kMaxMvCols];
+    for (int64_t e = 0; e < NX; ++e) {
+        const int32_t count = cnt[(size_t) e];
+        if (!count) continue;
+        const int c = im.g.cls(layer, e);
+        if (c < 0 || c >= (int) im.g.xl_k2_gate.size()) return false;
+        const Ds41Exl3Layout L = ds41_exl3_layout(H, FF, im.g.xl_k2_gate[(size_t) c], im.g.xl_k2_up[(size_t) c],
+                                                  im.g.xl_k2_down[(size_t) c]);
+        const uint8_t* dev = nullptr;
+        if (gp.cache && !im.cfg.no_cache) {
+            const int32_t slot = gp.cache->slot_of(layer, e);
+            if (slot >= 0) { dev = gp.cache->device_slot(slot); ++st.hits; }
+        }
+        if (!dev) {
+            if (const uint8_t* p = gp.arena.ptr(layer, e)) {
+                dev = (const uint8_t*) gp.d_stage;
+                ck(cudaMemcpyAsync((void*) dev, p, L.bytes, cudaMemcpyHostToDevice, gp.s), "exl3 chunk arena");
+                ++st.pcie;
+            } else {
+                if (!gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * (size_t) B), "h_fstage");
+                im.blobs->read(layer, e, gp.h_fstage);
+                dev = (const uint8_t*) gp.d_stage;
+                ck(cudaMemcpyAsync((void*) dev, gp.h_fstage, L.bytes, cudaMemcpyHostToDevice, gp.s), "exl3 chunk file");
+                ++st.file_tier;
+            }
+        }
+        const int64_t dims[3][2] = {{H, FF}, {H, FF}, {FF, H}};
+        x3::Mat* mats[3] = {&gm, &um, &dm};
+        for (int r = 0; r < 3; ++r) {
+            x3::Mat& m = *mats[r];
+            m = x3::Mat();
+            m.trellis = (const uint32_t*) (dev + L.trellis[r]);
+            m.suh = (const uint16_t*) (dev + L.suh[r]);
+            m.svh = (const uint16_t*) (dev + L.svh[r]);
+            m.k = (int) dims[r][0];
+            m.n = (int) dims[r][1];
+            m.k2 = L.k2[r];
+            m.cb = 2;
+        }
+        int mc = MC;
+        for (x3::Mat* m : mats) {
+            const int cap = x3::mv_cols(*m);
+            if (cap > 0) mc = std::min(mc, cap);
+        }
+        if (mc < 1) mc = 1;
+        for (int32_t base = 0; base < count; base += mc) {
+            const int b = (int) std::min<int32_t>(mc, count - base);
+            for (int p = 0; p < b; ++p) {
+                const int32_t idx = pairs[(size_t) start[(size_t) e] + base + p];
+                const int32_t t = idx / (int32_t) K;
+                htok[p] = t;
+                hw[p] = w[idx];
+                ck(cudaMemcpyAsync((float*) gp.d_exl3_xg + (size_t) p * (size_t) H, x + (size_t) t * (size_t) H,
+                                   (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "exl3 chunk x row");
+            }
+            ck(cudaMemcpyAsync(gp.d_exl3_ptok, htok, sizeof(int32_t) * (size_t) b, cudaMemcpyHostToDevice, gp.s),
+               "exl3 chunk tokens");
+            ck(cudaMemcpyAsync(gp.d_exl3_pw, hw, sizeof(float) * (size_t) b, cudaMemcpyHostToDevice, gp.s),
+               "exl3 chunk weights");
+            gj[0].m = &gm;
+            gj[0].xf = (const float*) gp.d_exl3_xg;
+            gj[0].y = (float*) gp.d_exl3_gb;
+            gj[0].ncol = b;
+            gj[0].xf_cs = (size_t) H;
+            gj[0].y_cs = (size_t) FF;
+            gj[1] = gj[0];
+            gj[1].m = &um;
+            gj[1].y = (float*) gp.d_exl3_ub;
+            if (!x3::mv(gj, 2, gp.s)) return false;
+            ds41_exl3_swiglu((const float*) gp.d_exl3_gb, (const float*) gp.d_exl3_ub, (float*) gp.d_exl3_hb,
+                             (long long) b * FF, im.g.swiglu_limit, gp.s);
+            dj[0].m = &dm;
+            dj[0].xf = (const float*) gp.d_exl3_hb;
+            dj[0].y = (float*) gp.d_exl3_pb;
+            dj[0].ncol = b;
+            dj[0].xf_cs = (size_t) FF;
+            dj[0].y_cs = (size_t) H;
+            if (!x3::mv(dj, 1, gp.s)) return false;
+            ds41_exl3_scatter_add((const float*) gp.d_exl3_pb, (const int32_t*) gp.d_exl3_ptok,
+                                  (const float*) gp.d_exl3_pw, b, (int) H, od, gp.s);
+        }
+        ck(cudaStreamSynchronize(gp.s), "exl3 chunk expert sync");
+    }
+    if (!out_dev)
+        ck(cudaMemcpyAsync(out, od, (size_t) n * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "exl3 chunk out d2h");
+    ck(cudaStreamSynchronize(gp.s), "exl3 chunk sync");
+    st.wall_ms = now_ms() - t0;
+    im.st.add(st);
+    return true;
+}
+
 bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
              const void* x_dev, float* out, void* out_dev = nullptr) {
+    const strata::core::OnDevice on_dev(im.device);   // slice B: this layer's launches, DMAs, graphs and fences run on cfg.device
     static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
     double tp = prof ? now_ms() : 0;
     auto mark = [&](int i) { if (prof) { const double t = now_ms(); g_prof[i] += t - tp; tp = t; } };
@@ -2250,7 +2901,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         const char* v = std::getenv("STRATA_TIER_GRAPH");
         return v != nullptr && v[0] != '0';
     }();
-    if (tier_graph_on && !gp.tier_graph_ready && !gp.tier_graph_off) {
+    if (!im.g.exl3 && tier_graph_on && !gp.tier_graph_ready && !gp.tier_graph_off) {
         if (tier_graph_capture(gp)) gp.tier_graph_ready = true;
         else {
             gp.tier_graph_off = true;
@@ -2855,6 +3506,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
 /// in order, exactly as gpu_run does for one token.
 bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w, const float* x_host,
                float* out) {
+    const strata::core::OnDevice on_dev(im.device);   // slice B: same-device contract for this call's card
     Gpu& gp = *im.gpu;
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
@@ -3044,6 +3696,7 @@ bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const
 /// ActQ (act_quant_any), the rest a native act slot.
 bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w,
                   const float* x_host, float* out, void* out_dev) {
+    const strata::core::OnDevice on_dev(im.device);   // slice B: same-device contract for this call's card
     Gpu& gp = *im.gpu;
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
@@ -3657,6 +4310,7 @@ int64_t chunk_stride(Ds41MoeImpl& im, int64_t layer) {
 // chunk_prestage: DMA `layer`'s arena experts that are not VRAM-resident, ascending ids, into device half `h` at the
 // run_chunk stride; run_chunk(layer) then only waits for c_copied[h].  The half must hold them all (else: skip).
 void chunk_prestage(Ds41MoeImpl& im, int64_t layer, int h) {
+    const strata::core::OnDevice on_dev(im.device);   // slice B: the prestage DMA runs on the tier's copy stream
     Gpu& gp = *im.gpu;
     gp.c_pre_layer = -1;
     if (!im.g.routed(layer) || !gp.s_cp) return;
@@ -3689,6 +4343,7 @@ int chunk_pstage_min() {
 
 /// The prestage region, allocated once (false = prestage off for good: STRATA_PRESTAGE_GIB=0 or no room).
 bool chunk_pstage_alloc(Ds41MoeImpl& im) {
+    const strata::core::OnDevice on_dev(im.device);   // slice B: cudaMemGetInfo and the region belong to the tier's card
     Gpu& gp = *im.gpu;
     if (gp.p_off) return false;
     if (!gp.p_buf) {
@@ -3720,6 +4375,7 @@ bool chunk_pstage_alloc(Ds41MoeImpl& im) {
 /// One loop for both, so an expert's region address - and with it the launch grouping and the kernel each run takes
 /// (MMVQ from the region, MMQ when streamed) - never depends on which of the two filled it.
 int chunk_pstage_fill(Ds41MoeImpl& im, int64_t layer, const int32_t* routed) {
+    const strata::core::OnDevice on_dev(im.device);   // slice B: the fill's DMAs and event run on the tier's copy stream
     Gpu& gp = *im.gpu;
     if (gp.p_used_rec) ck(cudaStreamWaitEvent(gp.s_cp, gp.p_used, 0), "pstage wait used");
     const int64_t NX = im.g.n_experts;
@@ -3768,6 +4424,7 @@ void chunk_pstage_issue(Ds41MoeImpl& im, int64_t layer) {
 // activations, `last` takes the weighted sum (each entry's parts row is written by exactly one class pass)
 bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x_host,
                    float* out, void* out_dev = nullptr, int cf = -1, bool first_pass = true, bool last_pass = true) {
+    const strata::core::OnDevice on_dev(im.device);   // slice B: the chunk's buffers, streams, graphs and fences live on cfg.device
     Gpu& gp = *im.gpu;
     const bool prof = chunk_prof();
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> kev;   // prof: one pair per grouped launch
@@ -4150,10 +4807,17 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         }
         if (!es.empty()) {
             ck(cudaStreamWaitEvent(gp.s, gp.p_copied, 0), "wait pstage");
+            // A hole left by an unrouted arena expert makes the whole run fail launch()'s physical-stride
+            // check and fall back to MMVQ. Opt in to the same pointer-adjacency splitting as c_pre below.
+            static const bool split_mmq = [] {
+                const char * v = std::getenv("STRATA_PRESTAGE_MMQ");
+                return v && v[0] == '1';
+            }();
             std::vector<int32_t> re;
             std::vector<unsigned long long> rp;
             for (size_t q = 0; q < es.size(); ++q) {
-                if (!re.empty() && first[(size_t) re.back()] + cnt[(size_t) re.back()] != first[(size_t) es[q]]) {
+                if (!re.empty() && (first[(size_t) re.back()] + cnt[(size_t) re.back()] != first[(size_t) es[q]] ||
+                                    (split_mmq && rp.back() + (unsigned long long) SL != ps[q]))) {
                     launch(re, rp);
                     re.clear();
                     rp.clear();
@@ -4476,36 +5140,38 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 }
 #endif
 
-bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
+bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out, std::string* err) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out) return false;
     rebal_count(*im_, layer, ids6, im_->g.top_k);
-    if (!im_->g.routed(layer)) return false;
+    if (!im_->g.routed(layer) || range_reject(*im_, layer, err)) return false;
     if (im_->cfg.cpu_only) return cpu_run(*im_, layer, ids6, w6, x, out);
 #if defined(DS4_MOE_CUDA)
+    if (im_->g.exl3) return gpu_run_exl3(*im_, layer, ids6, w6, x, nullptr, out, nullptr);
     return gpu_run(*im_, layer, ids6, w6, x, nullptr, out);
 #else
     return false;
 #endif
 }
 
-bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev) {
+bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev, std::string* err) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out_dev) return false;
     rebal_count(*im_, layer, ids6, im_->g.top_k);
-    if (!im_->g.routed(layer) || im_->cfg.cpu_only) return false;
+    if (!im_->g.routed(layer) || im_->cfg.cpu_only || range_reject(*im_, layer, err)) return false;
 #if defined(DS4_MOE_CUDA)
+    if (im_->g.exl3) return gpu_run_exl3(*im_, layer, ids6, w6, x, nullptr, nullptr, out_dev);
     return gpu_run(*im_, layer, ids6, w6, x, nullptr, nullptr, out_dev);
 #else
     return false;
 #endif
 }
 
-bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out) {
+bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out, std::string* err) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids || !w || !x || !out || nt < 1 || nt > kMaxTok) return false;
     rebal_count(*im_, layer, ids, (int64_t) nt * im_->g.top_k);
-    if (!im_->g.routed(layer)) return false;
+    if (!im_->g.routed(layer) || range_reject(*im_, layer, err)) return false;
     if (im_->cfg.cpu_only) {   // the CPU tier: token by token (no sharing; it is not the verify path)
         const int64_t K = im_->g.top_k, H = im_->g.n_embd;
         for (int t = 0; t < nt; ++t)
@@ -4513,6 +5179,13 @@ bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const flo
         return true;
     }
 #if defined(DS4_MOE_CUDA)
+    if (im_->g.exl3) {
+        const int64_t K = im_->g.top_k, H = im_->g.n_embd;
+        for (int t = 0; t < nt; ++t)
+            if (!gpu_run_exl3(*im_, layer, ids + t * K, w + t * K, x + (size_t) t * H, nullptr,
+                              out + (size_t) t * H, nullptr)) return false;
+        return true;
+    }
     if (im_->g.per_expert()) {   // D3: the batched per-class path; per-token only if it declines (a q2 class)
         if (gpu_run_n_ex(*im_, layer, nt, ids, w, x, out, nullptr)) return true;
         const int64_t K = im_->g.top_k, H = im_->g.n_embd;
@@ -4534,15 +5207,24 @@ void Ds41MoeTier::profiler(bool on) {
 #endif
 }
 
-bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev) {
+bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev, std::string* err) {
+#if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // its own h2d + sync below run on the tier's stream, on its card
+#endif
     if (!im_->inited || !im_->pool) return false;
     if (!ids || !w || !x || !out_dev || nt < 1 || nt > kMaxTok) return false;
     rebal_count(*im_, layer, ids, (int64_t) nt * im_->g.top_k);
-    if (!im_->g.routed(layer)) return false;
+    if (!im_->g.routed(layer) || range_reject(*im_, layer, err)) return false;
     if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER run_multi_to_dev layer=%lld nt=%d\n", (long long) layer, nt);
 #if defined(DS4_MOE_CUDA)
     if (!im_->cfg.cpu_only) {
         const int64_t K = im_->g.top_k, H = im_->g.n_embd;
+        if (im_->g.exl3) {
+            for (int t = 0; t < nt; ++t)
+                if (!gpu_run_exl3(*im_, layer, ids + t * K, w + t * K, x + (size_t) t * H, nullptr, nullptr,
+                                  (uint8_t*) out_dev + (size_t) t * (size_t) H * 4)) return false;
+            return true;
+        }
         if (im_->g.per_expert()) {
             if (gpu_run_n_ex(*im_, layer, nt, ids, w, x, nullptr, out_dev)) return true;
             for (int t = 0; t < nt; ++t)   // per-expert fallback (a q2 class): per-token run_to_dev, NOT gpu_run_n
@@ -4579,6 +5261,7 @@ const std::vector<int64_t>& Ds41MoeTier::saliency_count() const { return im_->sa
 
 void Ds41MoeTier::release_cache() {
 #if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // the fence and the slot frees belong to the tier's card
     if (!im_->gpu || !im_->gpu->cache) return;
     cudaDeviceSynchronize();   // no copy or kernel may still read a slot
     // warm_reseed (STRATA_WARM_RESEED=1 = on; OFF by default until it shows an effect): before the slots go, record
@@ -4619,6 +5302,7 @@ bool Ds41MoeTier::keep_cache_mode() {
 
 int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
 #if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // the fence and cudaMemGetInfo are per-device: ask the tier's card
     // every refusal says why (s6: the first A/B never kept the cache and logged nothing)
     if (!im_->gpu || !im_->gpu->cache) { err = "no VRAM cache"; return -1; }
     if (!im_->gpu->cache->segmented()) { err = "the cache is not segmented"; return -1; }
@@ -4659,6 +5343,7 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
 
 int64_t Ds41MoeTier::regrow_cache(std::string& err) {
 #if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // grow, the fills' copies and the pinned buffer: the tier's card
     if (im_->shrunk.empty() || !im_->gpu || !im_->gpu->cache) { im_->shrunk.clear(); return 0; }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     const double t0 = now_ms();
@@ -4715,6 +5400,7 @@ int64_t Ds41MoeTier::regrow_cache(std::string& err) {
 
 bool Ds41MoeTier::release_prestage() {
 #if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // the region and its events live on the tier's card
     if (!im_->gpu || !im_->gpu->p_buf) return false;
     Gpu& gp = *im_->gpu;
     cudaDeviceSynchronize();   // no DMA into it and no expert kernel reading from it is still in flight
@@ -4736,6 +5422,7 @@ bool Ds41MoeTier::release_prestage() {
 
 void Ds41MoeTier::release_chunk() {
 #if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // the stream syncs and the cudaFree of the chunk buffers run on its card
     if (!im_->gpu) return;
     if (chunk_prof() && g_cprof.calls) {
         const ChunkProf& c = g_cprof;
@@ -4764,6 +5451,8 @@ void Ds41MoeTier::release_chunk() {
     Gpu& gp = *im_->gpu;
     if (gp.s) cudaStreamSynchronize(gp.s);
     if (gp.s_cp) cudaStreamSynchronize(gp.s_cp);
+    if (gp.xl_chunk.copy) cudaStreamSynchronize(gp.xl_chunk.copy);
+    gp.xl_chunk.release();
     // The DEVICE buffers go back (the deferred VRAM seed wants the memory).  The PINNED landing pads (c_bounce,
     // c_hparts) and the chunk_prefetch slabs stay: cudaMallocHost was 13 calls / 3.4 s per prompt (nsys), and a
     // pinned slab's pages must not be churned.  Only close() (or a manual release) frees them.
@@ -4798,10 +5487,12 @@ void Ds41MoeTier::release_chunk() {
 #endif
 }
 
-bool Ds41MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out) {
+bool Ds41MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out, std::string* err) {
     if (!im_->inited || !ids || !w || !x || !out || n < 1) return false;
-    if (!im_->g.routed(layer)) return false;
+    if (!im_->g.routed(layer) || range_reject(*im_, layer, err)) return false;
 #if defined(DS4_MOE_CUDA)
+    if (im_->gpu && !im_->cfg.cpu_only && im_->g.exl3)
+        return gpu_run_exl3_chunk(*im_, layer, n, ids, w, x, out, nullptr);
     if (im_->gpu && !im_->cfg.cpu_only) return chunk_classes(*im_, layer, n, ids, w, x, out, nullptr);
 #endif
     // CPU tier: token by token
@@ -4811,22 +5502,25 @@ bool Ds41MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const floa
     return true;
 }
 
-bool Ds41MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev) {
+bool Ds41MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev, std::string* err) {
     if (!im_->inited || !ids || !w || !x || !out_dev || n < 1) return false;
-    if (!im_->g.routed(layer)) return false;
+    if (!im_->g.routed(layer) || range_reject(*im_, layer, err)) return false;
 #if defined(DS4_MOE_CUDA)
+    if (im_->gpu && !im_->cfg.cpu_only && im_->g.exl3)
+        return gpu_run_exl3_chunk(*im_, layer, n, ids, w, x, nullptr, out_dev);
     if (im_->gpu && !im_->cfg.cpu_only) return chunk_classes(*im_, layer, n, ids, w, x, nullptr, out_dev);
 #endif
     return false;
 }
 
-bool Ds41MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out) {
+bool Ds41MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out, std::string* err) {
     if (!im_->inited) return false;
     if (!ids6 || !w6 || !x_dev || !out) return false;
     rebal_count(*im_, layer, ids6, im_->g.top_k);
-    if (!im_->g.routed(layer)) return false;
+    if (!im_->g.routed(layer) || range_reject(*im_, layer, err)) return false;
     if (im_->cfg.cpu_only) return false;   // there is no device input without a device tier
 #if defined(DS4_MOE_CUDA)
+    if (im_->g.exl3) return gpu_run_exl3(*im_, layer, ids6, w6, nullptr, x_dev, out, nullptr);
     return gpu_run(*im_, layer, ids6, w6, nullptr, x_dev, out);
 #else
     return false;
@@ -4896,7 +5590,7 @@ struct Rebal {
 };
 
 void rebal_count(Ds41MoeImpl& im, int64_t layer, const int32_t* ids, int64_t n) {
-    if (!im.rebal || layer < 0 || layer >= im.g.n_layers) return;
+    if (!im.rebal || layer < 0 || layer >= im.g.n_layers || out_of_range(im, layer)) return;   // slice B: a split tier counts only its own layers
     const int64_t NX = im.g.n_experts;
     float* sc = im.rebal->score.data() + (size_t) (layer * NX);
     for (int64_t i = 0; i < n; ++i)
@@ -5129,6 +5823,7 @@ void Ds41MoeTier::rebalance_plan() {
 
 void Ds41MoeTier::rebalance_tick(bool request_end) {
 #if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // the retire fence is the tier's device fence
     if (!im_ || !im_->rebal || !im_->gpu) return;
     Rebal& r = *im_->rebal;
     rebal_publish(*im_);
@@ -5165,6 +5860,7 @@ void Ds41MoeTier::close() {
 #endif
     if (!im_) return;
 #if defined(DS4_MOE_CUDA)
+    const strata::core::OnDevice on_dev(im_->device);   // the slabs, the Gpu's buffers and its streams free on that card
     chunk_stage_close(*im_);   // join the prefetch readers, free the pinned slabs
 #endif
     if (im_->gpu) im_->gpu->close();
@@ -5192,6 +5888,7 @@ const char* Ds41MoeTier::mode() const {
 
 int64_t Ds41MoeTier::resident() const { return im_->admitted; }
 int64_t Ds41MoeTier::blob_bytes(int64_t layer) const {
+    if (im_->g.exl3) return im_->blob;
     if (layer < 0 || layer >= (int64_t) im_->bl.size()) return 0;
     return im_->bl[(size_t) layer];
 }
@@ -5263,8 +5960,8 @@ void Ds41MoeStats::add(const Ds41MoeStats& o) {
 
 Ds41FileBlobs::Ds41FileBlobs(std::string gguf) : path_(std::move(gguf)) {}
 Ds41FileBlobs::~Ds41FileBlobs() {
-    if (fd_ >= 0) ::close(fd_);
-    if (dfd_ >= 0) ::close(dfd_);
+    for (int f : fd_) if (f >= 0) ::close(f);
+    for (int f : dfd_) if (f >= 0) ::close(f);
     if (mfd_ >= 0) ::close(mfd_);
     for (uint8_t* p : ball_) std::free(p);
 }
@@ -5286,12 +5983,213 @@ void Ds41FileBlobs::give_bounce(uint8_t* p) const {
     bfree_.push_back(p);
 }
 
+// ---- SAGE EXL3: one header scan of the model's shards, then three preads per routed expert ---------------------
+
+/// The object after a safetensors tensor name: its dtype, shape and data_offsets.  The header is a flat JSON object;
+/// these keys are the only ones the engine reads, so a full JSON dependency is not needed.
+struct StTensor {
+    std::string name, dtype;
+    std::vector<int64_t> shape;
+    uint64_t off = 0, bytes = 0;
+};
+
+static bool st_parse_tensor(const std::string& h, size_t key, StTensor& t, std::string& err) {
+    const size_t colon = h.find(':', key);
+    if (colon == std::string::npos) return false;
+    const size_t obj = h.find('{', colon);
+    const size_t end = h.find('}', obj);
+    if (obj == std::string::npos || end == std::string::npos) return false;
+    auto str = [&](const char* key, std::string& out) {
+        const std::string pat = std::string("\"") + key + "\":\"";
+        const size_t p = h.find(pat, obj);
+        if (p == std::string::npos || p > end) return false;
+        const size_t a = p + pat.size(), b = h.find('"', a);
+        if (b == std::string::npos || b > end) return false;
+        out = h.substr(a, b - a);
+        return true;
+    };
+    if (!str("dtype", t.dtype)) { err = t.name + ": no dtype"; return false; }
+    const std::string sp = "\"shape\":[";
+    size_t p = h.find(sp, obj);
+    if (p == std::string::npos || p > end) { err = t.name + ": no shape"; return false; }
+    p += sp.size();
+    while (p < end && h[p] != ']') {
+        while (p < end && (h[p] == ' ' || h[p] == ',')) ++p;
+        if (p >= end || h[p] == ']') break;
+        char* q = nullptr;
+        const long long v = std::strtoll(h.c_str() + p, &q, 10);
+        if (q == h.c_str() + p) { err = t.name + ": bad shape"; return false; }
+        t.shape.push_back((int64_t) v);
+        p = (size_t) (q - h.c_str());
+    }
+    const std::string op = "\"data_offsets\":[";
+    p = h.find(op, obj);
+    if (p == std::string::npos || p > end) { err = t.name + ": no data_offsets"; return false; }
+    p += op.size();
+    uint64_t v[2] = {0, 0};
+    for (int i = 0; i < 2; ++i) {
+        while (p < end && (h[p] == ' ' || h[p] == ',')) ++p;
+        char* q = nullptr;
+        v[i] = std::strtoull(h.c_str() + p, &q, 10);
+        if (q == h.c_str() + p) { err = t.name + ": bad data_offsets"; return false; }
+        p = (size_t) (q - h.c_str());
+    }
+    if (v[1] < v[0]) { err = t.name + ": decreasing data_offsets"; return false; }
+    t.off = v[0];
+    t.bytes = v[1] - v[0];
+    return true;
+}
+
+bool Ds41FileBlobs::open_exl3(const std::string& dir, const Ds41MoeGeom& base, std::string& err) {
+    if (!fd_.empty()) return true;
+    const int64_t NL = base.n_layers, NE = base.n_experts, D = base.n_embd, FF = base.n_ff;
+    if (NL <= 0 || NE <= 0 || D % 128 || FF % 128) { err = "EXL3: bad base geometry"; return false; }
+    std::vector<std::string> files;
+    DIR* dp = ::opendir(dir.c_str());
+    if (!dp) { err = "cannot open EXL3 directory " + dir; return false; }
+    while (dirent* de = ::readdir(dp)) {
+        const std::string n = de->d_name;
+        if (n.size() > 12 && n.compare(n.size() - 12, 12, ".safetensors") == 0 &&
+            n.find("model-") == 0 && n.find("-of-") != std::string::npos) files.push_back(n);
+    }
+    ::closedir(dp);
+    std::sort(files.begin(), files.end());
+    if (files.empty()) { err = "no model-*.safetensors in " + dir; return false; }
+    xl_file_ = files;
+
+    const size_t nent = (size_t) (NL * NE);
+    xl_span_.assign(nent * 9, XlSpan());
+    std::vector<int32_t> ek2(nent * 3, 0);
+    for (size_t fi = 0; fi < files.size(); ++fi) {
+        const std::string path = dir + "/" + files[fi];
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) { err = "cannot open " + path; return false; }
+        uint64_t hl = 0;
+        if (::pread(fd, &hl, 8, 0) != 8 || hl == 0 || hl > (1u << 28)) {
+            ::close(fd);
+            err = path + ": bad safetensors header length";
+            return false;
+        }
+        std::string h((size_t) hl, '\0');
+        if (::pread(fd, &h[0], (size_t) hl, 8) != (ssize_t) hl) {
+            ::close(fd);
+            err = path + ": short safetensors header";
+            return false;
+        }
+        fd_.push_back(fd);
+        dfd_.push_back(-1);
+        const uint64_t data0 = 8 + hl;
+        size_t p = 0;
+        while ((p = h.find("\"layers.", p)) != std::string::npos) {
+            ++p;
+            const size_t q = h.find('"', p);
+            if (q == std::string::npos) break;
+            const std::string name = h.substr(p, q - p);
+            int l = -1, e = -1, w = 0;
+            char part[16] = {};
+            if (std::sscanf(name.c_str(), "layers.%d.ffn.experts.%d.w%d.%15s", &l, &e, &w, part) != 4 ||
+                l < 0 || l >= NL || e < 0 || e >= NE || w < 1 || w > 3) {
+                p = q;
+                continue;
+            }
+            int pi = -1, role = -1;
+            const std::string ps = part;
+            if (ps == "suh") { pi = 0; }
+            else if (ps == "svh") { pi = 1; }
+            else if (ps == "trellis") { pi = 2; }
+            if (pi >= 0) {
+                role = w == 1 ? 0 : w == 3 ? 1 : 2;
+                StTensor t;
+                t.name = name;
+                if (!st_parse_tensor(h, q, t, err)) { ::close(fd); fd_.pop_back(); dfd_.pop_back(); return false; }
+                const int64_t k = role < 2 ? D : FF, n = role < 2 ? FF : D;
+                if (pi == 2) {
+                    if (t.dtype != "I16" || t.shape.size() != 3 || t.shape[0] != k / 16 || t.shape[1] != n / 16 ||
+                        t.shape[2] % 8 != 0) {
+                        err = name + ": not an EXL3 trellis for " + std::to_string(k) + "x" + std::to_string(n);
+                        ::close(fd); fd_.pop_back(); dfd_.pop_back();
+                        return false;
+                    }
+                    const int k2 = (int) (t.shape[2] / 8);
+                    if (!(k2 >= 2 && k2 <= 16 && (!(k2 & 1) || k2 == 3 || k2 == 5 || k2 == 7))) {
+                        err = name + ": unsupported K2 " + std::to_string(k2);
+                        ::close(fd); fd_.pop_back(); dfd_.pop_back();
+                        return false;
+                    }
+                    ek2[(size_t) ((l * NE + e) * 3 + role)] = k2;
+                } else {
+                    const int64_t want = pi == 0 ? k : n;
+                    if (t.dtype != "F16" || t.shape.size() != 1 || t.shape[0] != want) {
+                        err = name + ": not an F16 " + (pi == 0 ? "suh" : "svh");
+                        ::close(fd); fd_.pop_back(); dfd_.pop_back();
+                        return false;
+                    }
+                }
+                const size_t at = (size_t) ((l * NE + e) * 9 + role * 3 + pi);
+                xl_span_[at].file = (int32_t) fi;
+                xl_span_[at].off = data0 + t.off;
+                xl_span_[at].bytes = t.bytes;
+            }
+            p = q;
+        }
+    }
+
+    std::map<std::array<int, 3>, int> cid;
+    g_ = base;
+    g_.eclass.assign(nent, 0);
+    g_.cls_gu.clear();
+    g_.cls_d.clear();
+    g_.xl_k2_gate.clear();
+    g_.xl_k2_up.clear();
+    g_.xl_k2_down.clear();
+    g_.exl3 = true;
+    g_.gu_type = g_.d_type = kDs41Exl3Type;
+    // every SAGE layer has all three roles for every expert (checked below), so the GGUF's per-layer
+    // "no experts" marks from the first shard do not apply
+    g_.gate_types.clear();
+    g_.up_types.clear();
+    g_.down_types.clear();
+    for (int64_t l = 0; l < NL; ++l)
+        for (int64_t e = 0; e < NE; ++e) {
+            const size_t i = (size_t) (l * NE + e);
+            const std::array<int, 3> key{ek2[i * 3], ek2[i * 3 + 1], ek2[i * 3 + 2]};
+            if (key[0] <= 0 || key[1] <= 0 || key[2] <= 0) {
+                err = "EXL3: layer " + std::to_string(l) + " expert " + std::to_string(e) + " is missing a role";
+                return false;
+            }
+            for (int r = 0; r < 3; ++r)
+                for (int p = 0; p < 3; ++p)
+                    if (xl_span_[i * 9 + (size_t) r * 3 + (size_t) p].bytes == 0) {
+                        err = "EXL3: layer " + std::to_string(l) + " expert " + std::to_string(e) + " is incomplete";
+                        return false;
+                    }
+            auto it = cid.find(key);
+            if (it == cid.end()) {
+                it = cid.emplace(key, (int) g_.cls_gu.size()).first;
+                g_.cls_gu.push_back(kDs41Exl3Type);
+                g_.cls_d.push_back(kDs41Exl3Type);
+                g_.xl_k2_gate.push_back(key[0]);
+                g_.xl_k2_up.push_back(key[1]);
+                g_.xl_k2_down.push_back(key[2]);
+            }
+            g_.eclass[i] = (int16_t) it->second;
+        }
+    for (size_t c = 0; c < g_.xl_k2_gate.size(); ++c) {
+        const Ds41Exl3Layout L = ds41_exl3_layout(D, FF, g_.xl_k2_gate[c], g_.xl_k2_up[c], g_.xl_k2_down[c]);
+        max_ = std::max(max_, L.bytes);
+    }
+    if (max_ == 0) { err = "EXL3: no experts read"; return false; }
+    exl3_ = true;
+    std::fprintf(stderr, "EXL3: %lld layers x %lld experts, %zu classes, %.2f MiB largest blob, %zu shards\n",
+                 (long long) NL, (long long) NE, g_.xl_k2_gate.size(), max_ / 1048576.0, files.size());
+    return true;
+}
+
 bool Ds41FileBlobs::open(std::string& err) {
-    if (fd_ >= 0) return true;
+    if (!fd_.empty()) return true;
     std::unique_ptr<GgufModel> m;
     try { m = std::make_unique<GgufModel>(GgufModel::open(path_)); }
     catch (const std::exception& e) { err = e.what(); return false; }
-    if (m->size() != 1) { err = "Ds41FileBlobs: expected a single-file GGUF"; return false; }
     Ds41Geometry G;
     if (!(err = ds41_read_geometry(*m, G)).empty()) return false;
     const std::vector<int64_t> layers = ds41_file_layers(*m, G);
@@ -5319,7 +6217,6 @@ bool Ds41FileBlobs::open(std::string& err) {
         }
     g_.gu_type = g_.cls_gu[0];
     g_.d_type = g_.cls_d[0];
-    const GgufFile& f = m->shard(0);
     auto rb = [](int t, int64_t n) {
         int be = 0, bb = 0;
         block_geometry((uint32_t) t, be, bb);
@@ -5332,31 +6229,53 @@ bool Ds41FileBlobs::open(std::string& err) {
     gate_off_.assign((size_t) (NL * NE), 0);
     up_off_.assign((size_t) (NL * NE), 0);
     down_off_.assign((size_t) (NL * NE), 0);
+    gate_sh_.assign((size_t) (NL * NE), 0);
+    up_sh_.assign((size_t) (NL * NE), 0);
+    down_sh_.assign((size_t) (NL * NE), 0);
     for (int64_t l = 0; l < NL; ++l) {
         const Ds41ExpertMap& X = G.experts[(size_t) l];
         for (int64_t e = 0; e < NE; ++e) {
             const int gt = X.gu_type[(size_t) e], dt = X.d_type[(size_t) e];
-            const TensorInfo* tg = f.find(X.gate_t.at(gt));
-            const TensorInfo* tu = f.find(X.up_t.at(gt));
-            const TensorInfo* td = f.find(X.down_t.at(dt));
+            size_t sg = 0, su = 0, sd = 0;
+            const TensorInfo* tg = m->find(X.gate_t.at(gt), &sg);
+            const TensorInfo* tu = m->find(X.up_t.at(gt), &su);
+            const TensorInfo* td = m->find(X.down_t.at(dt), &sd);
             const uint64_t gb = rb(gt, D) * (uint64_t) FF, db = rb(dt, FF) * (uint64_t) D;
             const size_t i = (size_t) (l * NE + e);
-            gate_off_[i] = f.data_start() + tg->offset + (uint64_t) X.gu_slot[(size_t) e] * gb;
-            up_off_[i] = f.data_start() + tu->offset + (uint64_t) X.gu_slot[(size_t) e] * gb;
-            down_off_[i] = f.data_start() + td->offset + (uint64_t) X.d_slot[(size_t) e] * db;
+            gate_sh_[i] = (int32_t) sg;
+            up_sh_[i] = (int32_t) su;
+            down_sh_[i] = (int32_t) sd;
+            gate_off_[i] = m->shard(sg).data_start() + tg->offset + (uint64_t) X.gu_slot[(size_t) e] * gb;
+            up_off_[i] = m->shard(su).data_start() + tu->offset + (uint64_t) X.gu_slot[(size_t) e] * gb;
+            down_off_[i] = m->shard(sd).data_start() + td->offset + (uint64_t) X.d_slot[(size_t) e] * db;
         }
     }
     for (size_t c = 0; c < g_.cls_gu.size(); ++c)
         max_ = std::max<size_t>(max_, (size_t) (2 * (uint64_t) gu_rb_[c] * (uint64_t) FF + (uint64_t) d_rb_[c] * (uint64_t) D));
-    fd_ = ::open(path_.c_str(), O_RDONLY);
-    if (fd_ < 0) { err = "cannot open " + path_; return false; }
-    ::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
-    // The chunk-prefetch reader pool's O_DIRECT twin (measured 2.25 -> 4.65 GB/s on the scattered expert pattern).
-    // STRATA_BLOB_DIRECT=0 keeps the buffered path; a filesystem that refuses O_DIRECT just leaves dfd_ = -1.
+    // One buffered fd (and, unless STRATA_BLOB_DIRECT=0, one O_DIRECT twin) per shard of the model: a span is read
+    // from the shard that holds its tensor.  A shard whose O_DIRECT open the filesystem refuses just has dfd = -1.
+    const size_t NS = m->size();
+    std::vector<int> fds(NS, -1), dfds(NS, -1);
     const char* dv = std::getenv("STRATA_BLOB_DIRECT");
-    if (!(dv && dv[0] == '0')) dfd_ = ::open(path_.c_str(), O_RDONLY | O_DIRECT);
-    // decode misses (read_part) through it too: random 6.75 MB blobs 1.43 vs 1.99 ms cold (rdbench, SSD NVME), and no
-    // page-cache churn inside the 84 GiB cgroup that also holds the pinned arena
+    const bool use_direct = !(dv && dv[0] == '0');
+    for (size_t s = 0; s < NS; ++s) {
+        const std::string& sp = m->shard(s).path();
+        fds[s] = ::open(sp.c_str(), O_RDONLY);
+        if (fds[s] < 0) {
+            for (int x : fds) if (x >= 0) ::close(x);
+            err = "cannot open " + sp;
+            return false;
+        }
+        ::posix_fadvise(fds[s], 0, 0, POSIX_FADV_RANDOM);
+        // The chunk-prefetch reader pool's O_DIRECT twin (measured 2.25 -> 4.65 GB/s on the scattered expert pattern).
+        // A filesystem that refuses O_DIRECT just leaves that twin closed; decode misses (read_part) through it too:
+        // random 6.75 MB blobs 1.43 vs 1.99 ms cold (rdbench, SSD NVME), and no page-cache churn inside the 84 GiB
+        // cgroup that also holds the pinned arena.
+        if (use_direct) dfds[s] = ::open(sp.c_str(), O_RDONLY | O_DIRECT);
+        if (dfds[s] >= 0) direct_ = true;
+    }
+    fd_.swap(fds);
+    dfd_.swap(dfds);
     const char* pd = std::getenv("STRATA_DECODE_DIRECT");
     part_direct_ = !(pd && pd[0] == '0');
     uint64_t smax = 0;
@@ -5366,7 +6285,7 @@ bool Ds41FileBlobs::open(std::string& err) {
     }
     scratch_ = (size_t) smax + 8192;   // the largest role span + the 4096-rounding a pread adds on both ends
     const char* mp = std::getenv("STRATA_BLOB_MIRROR");
-    if (mp && mp[0] && part_direct_ && dfd_ >= 0) {
+    if (mp && mp[0] && part_direct_ && direct_) {
         std::string merr;
         if (!open_mirror(mp, merr)) std::fprintf(stderr, "blob mirror: NOT used (%s)\n", merr.c_str());
     }
@@ -5374,7 +6293,8 @@ bool Ds41FileBlobs::open(std::string& err) {
 }
 
 // The mirror file: a 4096-byte-aligned header, then the blobs, each [gate | up | down] padded to 4096.
-//   header: "S41MIRR1", u64 source file size, u64 n, u64 data start; then n x {i32 layer, i32 expert, u64 offset}
+//   header: "S41MIRR1", u64 source model size (the sum over the shards), u64 n, u64 data start; then n x {i32 layer,
+//   i32 expert, u64 offset}
 namespace {
 struct MirrorHead { char magic[8]; uint64_t src_size, n, data; };
 struct MirrorEnt { int32_t l, e; uint64_t off; };
@@ -5384,15 +6304,21 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
     const int fd = ::open(path, O_RDONLY | O_DIRECT);
     if (fd < 0) { err = std::string("cannot open ") + path + " O_DIRECT"; return false; }
     auto fail = [&](const std::string& m) { ::close(fd); err = m; return false; };
-    struct stat st{}, ss{};
-    if (::fstat(fd, &st) != 0 || ::fstat(fd_, &ss) != 0) return fail("fstat");
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) return fail("fstat");
+    uint64_t src_total = 0;   // a split model is its shards: the check is against their sum
+    for (int f : fd_) {
+        struct stat ss{};
+        if (::fstat(f, &ss) != 0) return fail("fstat");
+        src_total += (uint64_t) ss.st_size;
+    }
     uint8_t* h = (uint8_t*) std::aligned_alloc(4096, 4096);
     std::unique_ptr<uint8_t, void (*)(void*)> hg(h, std::free);
     if (::pread(fd, h, 4096, 0) != 4096) return fail("short header");
     MirrorHead H;
     std::memcpy(&H, h, sizeof H);
     if (std::memcmp(H.magic, "S41MIRR1", 8) != 0) return fail("bad magic");
-    if (H.src_size != (uint64_t) ss.st_size) return fail("built from a different model file (size)");
+    if (H.src_size != src_total) return fail("built from a different model file (size)");
     const uint64_t NE = (uint64_t) (g_.n_layers * g_.n_experts);
     if (H.n == 0 || H.n > NE || H.data < sizeof H + H.n * sizeof(MirrorEnt) || (H.data & 4095)) return fail("bad header");
     const size_t tb = (size_t) H.data;
@@ -5448,9 +6374,13 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
 
 bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order,
                                  uint64_t budget, std::string& err) const {
-    if (fd_ < 0) { err = "source not open"; return false; }
-    struct stat ss{};
-    ::fstat(fd_, &ss);
+    if (fd_.empty()) { err = "source not open"; return false; }
+    uint64_t src_total = 0;   // a split model is its shards: the header records their sum
+    for (int f : fd_) {
+        struct stat ss{};
+        if (::fstat(f, &ss) != 0) { err = "fstat failed"; return false; }
+        src_total += (uint64_t) ss.st_size;
+    }
     std::vector<MirrorEnt> ent;
     std::vector<uint8_t> seen((size_t) (g_.n_layers * g_.n_experts), 0);
     uint64_t bytes = 0;
@@ -5487,7 +6417,7 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
         std::memset(h, 0, (size_t) data);
         MirrorHead H;
         std::memcpy(H.magic, "S41MIRR1", 8);
-        H.src_size = (uint64_t) ss.st_size;
+        H.src_size = src_total;
         H.n = ent.size();
         H.data = data;
         std::memcpy(h, &H, sizeof H);
@@ -5544,7 +6474,6 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
 }
 
 bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd) const {
-    if (fd < 0) fd = dfd_;
     if (fd < 0 || !scratch || !n) return false;
     constexpr uint64_t A = 4096;
     const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
@@ -5561,7 +6490,7 @@ bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* s
 }
 
 void Ds41FileBlobs::read_staged(int64_t layer, int64_t expert, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const {
-    if (dfd_ < 0 || scratch_bytes < scratch_) {
+    if (exl3_ || !direct_ || scratch_bytes < scratch_) {
         read(layer, expert, dst);
         return;
     }
@@ -5569,7 +6498,7 @@ void Ds41FileBlobs::read_staged(int64_t layer, int64_t expert, uint8_t* dst, uin
     spans(layer, expert, s);
     uint64_t at = 0;
     for (const Span& x : s) {
-        if (!read_direct(x.off, (size_t) x.bytes, dst + at, scratch, scratch_bytes)) {
+        if (!read_direct(x.off, (size_t) x.bytes, dst + at, scratch, scratch_bytes, dfd_[(size_t) x.shard])) {
             read(layer, expert, dst);   // one short/refused span: fall back to the buffered whole-blob read
             return;
         }
@@ -5578,15 +6507,27 @@ void Ds41FileBlobs::read_staged(int64_t layer, int64_t expert, uint8_t* dst, uin
 }
 
 void Ds41FileBlobs::advise(int64_t layer, int64_t expert) const {
-    if (fd_ < 0) return;
+    if (fd_.empty()) return;
+    if (exl3_) {
+        const size_t i = (size_t) (layer * g_.n_experts + expert) * 9;
+        for (int k = 0; k < 9; ++k) {
+            const XlSpan& x = xl_span_[i + (size_t) k];
+            if (x.bytes) ::posix_fadvise(fd_[(size_t) x.file], (off_t) x.off, (off_t) x.bytes, POSIX_FADV_WILLNEED);
+        }
+        return;
+    }
     Span s[3];
     spans(layer, expert, s);
     for (const Span& x : s)
-        if (x.bytes) ::posix_fadvise(fd_, (off_t) x.off, (off_t) x.bytes, POSIX_FADV_WILLNEED);
+        if (x.bytes) ::posix_fadvise(fd_[(size_t) x.shard], (off_t) x.off, (off_t) x.bytes, POSIX_FADV_WILLNEED);
 }
 
 size_t Ds41FileBlobs::expert_bytes(int64_t l, int64_t e) const {
     const int c = g_.cls(l, e);
+    if (exl3_) {
+        return ds41_exl3_layout(g_.n_embd, g_.n_ff, g_.xl_k2_gate[(size_t) c], g_.xl_k2_up[(size_t) c],
+                                g_.xl_k2_down[(size_t) c]).bytes;
+    }
     return (size_t) (2 * (uint64_t) gu_rb_[(size_t) c] * (uint64_t) g_.n_ff + (uint64_t) d_rb_[(size_t) c] * (uint64_t) g_.n_embd);
 }
 
@@ -5600,9 +6541,9 @@ void Ds41FileBlobs::spans(int64_t l, int64_t e, Span s[3]) const {
     const size_t i = (size_t) (l * g_.n_experts + e);
     const int c = g_.cls(l, e);
     const uint64_t gb = (uint64_t) gu_rb_[(size_t) c] * (uint64_t) g_.n_ff, db = (uint64_t) d_rb_[(size_t) c] * (uint64_t) g_.n_embd;
-    s[0] = {gate_off_[i], gb};
-    s[1] = {up_off_[i], gb};
-    s[2] = {down_off_[i], db};
+    s[0] = {gate_sh_[i], gate_off_[i], gb};
+    s[1] = {up_sh_[i], up_off_[i], gb};
+    s[2] = {down_sh_[i], down_off_[i], db};
 }
 
 // bytes [lo, hi) of the blob [gate | up | down] into dst + lo
@@ -5620,16 +6561,50 @@ static void pread_all(int fd, uint8_t* dst, uint64_t off, uint64_t n) {
 }
 
 void Ds41FileBlobs::read(int64_t layer, int64_t expert, uint8_t* dst) const {
+    if (exl3_) {
+        const int c = g_.cls(layer, expert);
+        const Ds41Exl3Layout L = ds41_exl3_layout(g_.n_embd, g_.n_ff, g_.xl_k2_gate[(size_t) c],
+                                                  g_.xl_k2_up[(size_t) c], g_.xl_k2_down[(size_t) c]);
+        const size_t i = (size_t) (layer * g_.n_experts + expert) * 9;
+        for (int r = 0; r < 3; ++r) {
+            const size_t off[3] = {L.suh[r], L.svh[r], L.trellis[r]};
+            for (int p = 0; p < 3; ++p) {
+                const XlSpan& x = xl_span_[i + (size_t) r * 3 + (size_t) p];
+                pread_all(fd_[(size_t) x.file], dst + off[p], x.off, x.bytes);
+            }
+        }
+        if (!exl3_fast() && L.bytes < max_) std::memset(dst + L.bytes, 0, max_ - L.bytes);
+        return;
+    }
     Span s[3];
     spans(layer, expert, s);
     uint64_t at = 0;
     for (const Span& x : s) {
-        pread_all(fd_, dst + at, x.off, x.bytes);
+        pread_all(fd_[(size_t) x.shard], dst + at, x.off, x.bytes);
         at += x.bytes;
     }
 }
 
 void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const {
+    if (exl3_) {
+        const int c = g_.cls(layer, expert);
+        const Ds41Exl3Layout L = ds41_exl3_layout(g_.n_embd, g_.n_ff, g_.xl_k2_gate[(size_t) c],
+                                                  g_.xl_k2_up[(size_t) c], g_.xl_k2_down[(size_t) c]);
+        const uint64_t total = L.bytes;
+        const uint64_t lo = total * (uint64_t) part / (uint64_t) nparts;
+        const uint64_t hi = total * (uint64_t) (part + 1) / (uint64_t) nparts;
+        const size_t i = (size_t) (layer * g_.n_experts + expert) * 9;
+        for (int r = 0; r < 3; ++r) {
+            const size_t off[3] = {L.suh[r], L.svh[r], L.trellis[r]};
+            for (int p = 0; p < 3; ++p) {
+                const XlSpan& x = xl_span_[i + (size_t) r * 3 + (size_t) p];
+                const uint64_t a = std::max<uint64_t>(lo, off[p]);
+                const uint64_t b = std::min<uint64_t>(hi, off[p] + x.bytes);
+                if (a < b) pread_all(fd_[(size_t) x.file], dst + a, x.off + (a - off[p]), b - a);
+            }
+        }
+        return;
+    }
     Span s[3];
     spans(layer, expert, s);
     const uint64_t total = s[0].bytes + s[1].bytes + s[2].bytes;
@@ -5638,7 +6613,7 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
     if (part + 1 < nparts) hi &= ~(uint64_t) 4095;
     else hi = total;
     uint64_t at = 0;
-    uint8_t* bb = part_direct_ && dfd_ >= 0 ? take_bounce() : nullptr;
+    uint8_t* bb = part_direct_ && direct_ ? take_bounce() : nullptr;
     // the mirror's share of the parts: part p goes there when floor((p+1)*share) > floor(p*share) - spread evenly,
     // and a 1-part read stays on the model file.  The mirror blob is contiguous: [lo, hi) is one aligned span there.
     if (mfd_ >= 0 && bb && nparts > 1 && ((part + 1) * mshare_) / 1000 != (part * mshare_) / 1000) {
@@ -5656,8 +6631,9 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
     }
     for (const Span& x : s) {
         const uint64_t a = std::max(lo, at), b = std::min(hi, at + x.bytes);
-        if (a < b && !(bb && read_direct(x.off + (a - at), (size_t) (b - a), dst + a, bb, scratch_)))
-            pread_all(fd_, dst + a, x.off + (a - at), b - a);
+        const int df = dfd_[(size_t) x.shard];
+        if (a < b && !(bb && read_direct(x.off + (a - at), (size_t) (b - a), dst + a, bb, scratch_, df)))
+            pread_all(fd_[(size_t) x.shard], dst + a, x.off + (a - at), b - a);
         at += x.bytes;
     }
     if (bb) give_bounce(bb);

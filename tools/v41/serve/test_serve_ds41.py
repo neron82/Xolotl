@@ -65,6 +65,19 @@ def t_template():
         check(f"effort {eff!r} -> {n}", f"Reasoning Effort: {n} " in got, got[:120])
     got = T.render([{"role": "user", "content": "q"}])
     check("effort default -> 75", "Reasoning Effort: 75 " in got)
+    # The official encoder deliberately drops old hidden reasoning. Its changed generation marker is
+    # a cache rewind point, not permission to preserve reasoning or to reuse stale rolling rings.
+    messages = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "first"}]
+    first = T.render(messages)
+    later = T.render(messages + [{"role": "assistant", "content": "answer", "reasoning_content": "hidden"},
+                                {"role": "user", "content": "second"}])
+    stable = first[:-len(E.thinking_start_token)]
+    check("thinking follow-up keeps prefix before final marker", later.startswith(stable))
+    check("thinking follow-up rewrites marker and drops reasoning",
+          later[len(stable):].startswith(E.thinking_end_token) and "hidden" not in later)
+    check("identical requests render identically", T.render(messages) == first)
+    changed = T.render(messages, reasoning_effort=30)
+    check("changed effort invalidates the changed prefix", changed != first and not changed.startswith(stable))
 
 
 def t_effort_kwargs():
@@ -136,6 +149,13 @@ def t_tokenizer(tok_dir):
     check("tokenizer: specials are single tokens", len(tok.encode(E.eos_token, parse_special=True)) == 1 and
           len(tok.encode(E.USER_SP_TOKEN, parse_special=True)) == 1, ids[:8])
     check("tokenizer round trip", tok.decode(ids) == p)
+    messages = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "first"}]
+    first = tok.encode(D.Ds41Template().render(messages), parse_special=True)
+    later = tok.encode(D.Ds41Template().render(messages + [
+        {"role": "assistant", "content": "answer", "reasoning_content": "hidden"},
+        {"role": "user", "content": "second"}]), parse_special=True)
+    lcp = next((i for i, (a, b) in enumerate(zip(first, later)) if a != b), min(len(first), len(later)))
+    check("tokenized thinking follow-up differs only at final prompt token", lcp == len(first) - 1, (lcp, len(first)))
     import serve.server as S
     svc = S.Service(S.MockEngine(tok, "x"), tok, D.Ds41Template())
     check("stop ids = <｜end▁of▁sentence｜> only", svc.stop_ids == set(tok.encode(E.eos_token, parse_special=True)), svc.stop_ids)

@@ -1,0 +1,59 @@
+{
+  "exe": "/home/neron/projects/xolotl/tools/v41/serve/ds41-engine.sh",
+  "args": [
+    "-m",
+    "/home/neron/models/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw/DeepSeek-V4.1-Flash-1017-Dense-Engram-00001-of-00003.gguf",
+    "--exl3-dir",
+    "/home/neron/models/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw",
+    "--backend",
+    "cuda",
+    "--experts",
+    "gpu",
+    "--rank",
+    "/home/neron/models/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw/rank.bin",
+    "--vision",
+    "--ctx",
+    "524288",
+    "--stop",
+    "1",
+    "--kv-fp4",
+    "--route-bias",
+    "0.5",
+    "--route-bias-file",
+    "0.3",
+    "--arena-adapt",
+    "--arena-gib",
+    "64",
+    "--prompt-batch",
+    "8192"
+  ],
+  "cwd": "/home/neron/projects/xolotl",
+  "tokenizer": "/home/neron/models/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw/tokenizer",
+  "model_name": "deepseek-v4.1-flash-sage-exl3",
+  "log": "/tmp/strata-ds41-sage.log",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "gpu": 1,
+  "env": {
+    "STRATA_SERVE_DSPARK": "",
+    "STRATA_EXL3_FAST": "1",
+    "MEMGUARD_ALLOW_COMFY": "1"
+  },
+  "sampling": {
+    "temperature": 0.8,
+    "top_p": 0.95
+  },
+  "api_monitor": true,
+  "reasoning_budget_tokens": 32768,
+  "vision": {
+    "exe": "/home/neron/projects/xolotl/tools/v41/vision/ds41_vision.py",
+    "python": "/home/neron/shared-venv-gpu/bin/python",
+    "mmproj": "/home/neron/models/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw/vision/1017-vision-f16.gguf",
+    "model": "/home/neron/models/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw/DeepSeek-V4.1-Flash-1017-Dense-Engram-00001-of-00003.gguf",
+    "reference_dir": "/home/neron/models/dsv41-inference-ref/inference",
+    "threads": 8,
+    "gpu": false,
+    "lazy": true,
+    "max_tokens": 1024
+  }
+}

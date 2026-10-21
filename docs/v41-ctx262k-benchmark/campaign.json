@@ -1,0 +1,45 @@
+{
+  "started": "2026-10-18T15:11:04.542545+00:00",
+  "phase": "complete",
+  "original_running": {
+    "pid": 3043800,
+    "uid": 1000,
+    "port": 8080,
+    "model": "deepseek-v4.1-flash",
+    "engine": "ds41",
+    "served_id": "deepseek-v4.1-flash-strata-gsq",
+    "unit": "battlestation-llm.service",
+    "managed": true,
+    "cmdline": "/home/neron/shared-venv-gpu/bin/python /home/neron/projects/xolotl/tools/v41/serve/serve_ds41.py --engine strata --config /home/neron/models/ds41-server.json --host 0.0.0.0 --port 8080",
+    "ctx": 262144,
+    "gpus": [
+      1
+    ],
+    "params_source": "console state",
+    "healthy": true
+  },
+  "requested_ctx": 262144,
+  "arena": "engine default 60 GiB",
+  "benchmark_exit": 0,
+  "verification_exit": 0,
+  "restored": {
+    "pid": 3539083,
+    "uid": 1000,
+    "port": 8080,
+    "model": "deepseek-v4.1-flash",
+    "engine": "ds41",
+    "served_id": "deepseek-v4.1-flash-strata-gsq",
+    "unit": "battlestation-llm.service",
+    "managed": true,
+    "cmdline": "/home/neron/shared-venv-gpu/bin/python /home/neron/projects/xolotl/tools/v41/serve/serve_ds41.py --engine strata --config /home/neron/models/ds41-server.json --host 0.0.0.0 --port 8080",
+    "ctx": 262144,
+    "gpus": [
+      1
+    ],
+    "params_source": "console state",
+    "healthy": true
+  },
+  "bge_health": 200,
+  "restore_exit": 0,
+  "finished": "2026-10-18T15:34:13.537184+00:00"
+}

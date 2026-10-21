@@ -60,6 +60,9 @@ namespace strata::v41 {
 
 namespace cpu = strata::kernels::cpu;
 
+/// The sentinel "type" of an EXL3 expert class in Ds41MoeGeom::cls_gu / cls_d (strata::kernels::exl3::kTypeEXL3).
+constexpr int kDs41Exl3Type = 200;
+
 // ================================ geometry ================================
 
 /// The routed-expert half of one DeepSeek-V4-Flash layer.  The defaults are the real model's
@@ -88,6 +91,10 @@ struct Ds41MoeGeom {
     /// GPU layout below is per class; the VRAM LRU swaps only within a (layer, class).
     std::vector<int16_t> eclass;
     std::vector<int> cls_gu, cls_d;
+    /// EXL3 experts (DeepSeek-V4.1 SAGE): eclass/cls_gu/cls_d stay the class map (cls_gu = cls_d = kTypeEXL3), and
+    /// these carry each class's trellis bitrate per role (gate, up, down) as k2 = 2 K.
+    bool exl3 = false;
+    std::vector<int> xl_k2_gate, xl_k2_up, xl_k2_down;
     bool per_expert() const { return !eclass.empty(); }
     int64_t n_classes() const { return per_expert() ? (int64_t) cls_gu.size() : n_layers; }
     int cls(int64_t l, int64_t e) const { return per_expert() ? (int) eclass[(size_t) (l * n_experts + e)] : (int) l; }
@@ -209,13 +216,21 @@ private:
 
 /// DeepSeek-V4.1 (`deepseek41`, tools/v41/v41_gguf.py): each expert's gate/up/down rows live in the stacked tensor of
 /// its type (slot = its rank among that type's experts).  A blob is assembled from the three spans with preads (page
-/// cache; no mmap of the 150 GiB file).  `geom()` is the per-expert-class geometry for the tier.
+/// cache; no mmap of the 150 GiB file).  A split GGUF is one model: each span is read from the shard that holds its
+/// tensor, so the offsets are per-shard and `fd_` / `dfd_` are one fd per shard.  `geom()` is the per-expert-class
+/// geometry for the tier.
 class Ds41FileBlobs : public Ds41BlobSource {
 public:
     explicit Ds41FileBlobs(std::string gguf);
     ~Ds41FileBlobs() override;
-    const char* kind() const override { return "deepseek41 gguf"; }
+    const char* kind() const override { return exl3_ ? "deepseek41 SAGE EXL3" : "deepseek41 gguf"; }
     bool open(std::string& err) override;
+    /// DeepSeek-V4.1 SAGE: `base` is the geometry of the dense GGUF (the model `path_`), and `dir` holds the EXL3
+    /// shards.  Only the routed experts are read from `dir`; every other tensor (attention, shared experts, Engram,
+    /// head) stays in `path_`.  Classes are the distinct (K_gate,K_up,K_down) triples, so a blob's size varies by
+    /// expert.  `open()` must not be called on this source.
+    bool open_exl3(const std::string& dir, const Ds41MoeGeom& base, std::string& err);
+    bool exl3() const { return exl3_; }
     size_t blob_bytes() const override { return max_; }
     size_t blob_bytes(int64_t l) const override;
     void read(int64_t layer, int64_t expert, uint8_t* dst) const override;
@@ -238,11 +253,12 @@ public:
                       std::string& err) const;
 
 private:
-    struct Span { uint64_t off = 0, bytes = 0; };
+    struct Span { int32_t shard = 0; uint64_t off = 0, bytes = 0; };   // the model shard these bytes live in
     void spans(int64_t l, int64_t e, Span s[3]) const;
-    /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
-    /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
-    bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd = -1) const;
+    /// One 4096-aligned `pread` of [off, off+n) through `fd` (the span's shard's O_DIRECT twin, or the mirror),
+    /// sliced out of `scratch`.  False when there is no such fd or the bounce is too small (the caller then falls
+    /// back to the buffered `read`).
+    bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd) const;
     bool open_mirror(const char* path, std::string& err);
     int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
     std::vector<uint64_t> moff_;          ///< per (layer, expert): the blob's offset in the mirror, ~0 = not mirrored
@@ -254,16 +270,24 @@ private:
     mutable std::mutex bmu_;
     mutable std::vector<uint8_t*> bfree_, ball_;
     bool part_direct_ = true;    ///< read_part through the O_DIRECT twin (STRATA_DECODE_DIRECT=0: buffered)
+    bool direct_ = false;        ///< a shard opened O_DIRECT (STRATA_BLOB_DIRECT=0: never)
     std::string path_;
-    int fd_ = -1;
-    int dfd_ = -1;               ///< O_DIRECT twin of fd_ (-1 where the filesystem refused it)
+    std::vector<int> fd_;        ///< one buffered fd per shard of the model (empty = not open)
+    std::vector<int> dfd_;       ///< O_DIRECT twin of each (-1 where the filesystem refused it)
     size_t scratch_ = 0;         ///< the aligned bounce one read_direct span needs
     Ds41MoeGeom g_;
     size_t max_ = 0;
     std::vector<uint64_t> base_;          ///< [layer * 3 * n_types...] see .cpp
     std::vector<int32_t> slot_gu_, slot_d_;
-    std::vector<uint64_t> gate_off_, up_off_, down_off_;   ///< per (layer, expert): absolute file offsets
+    std::vector<uint64_t> gate_off_, up_off_, down_off_;   ///< per (layer, expert): offset inside its shard
+    std::vector<int32_t> gate_sh_, up_sh_, down_sh_;       ///< per (layer, expert): the shard holding it
     std::vector<uint32_t> gu_rb_, d_rb_;                   ///< per class: row bytes of gate/up and of down
+    /// EXL3: this source is a SAGE directory, not the GGUF's expert tensors.
+    struct XlSpan { int32_t file = 0; uint64_t off = 0, bytes = 0; };
+    bool exl3_ = false;
+    std::vector<XlSpan> xl_span_;       ///< per (layer, expert): 9 spans (role x [suh, svh, trellis])
+    std::vector<int32_t> xl_k2_;        ///< per class: gate, up, down k2
+    std::vector<std::string> xl_file_;  ///< the EXL3 shards, in fd_ order
 };
 
 /// Experts ranked by calibration routing counts (tools/v41/engine/v41_rank.py writes int32 (layer, expert) pairs).
@@ -339,6 +363,18 @@ struct Ds41MoeConfig {
     /// expert; only where the blob sits changes.  Off = the static seed, as before.
     bool vram_lru = false;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
+    /// SPLIT (slice B, the way upstream runs one model across cards, docs/MULTI_GPU.md): the CUDA device this
+    /// tier's buffers, streams, graphs and VRAM cache live on.  -1 = today: the caller's current device and no
+    /// OnDevice wrapping anywhere.  >= 0: every raw CUDA call in the impl that allocates, captures, launches or
+    /// fences on the tier's own device runs under `strata::core::OnDevice(device)`, so the tier works from a
+    /// thread that is current on any device.  Ignored in `cpu_only` (there is no CUDA to place).
+    int device = -1;
+    /// SPLIT: the first model layer this tier serves.  0 = all of them (today).  With a range set, expert
+    /// seeding, the arena/cache fill and the prefetch hints use only `[layer_lb, layer_le)`, and a run call for
+    /// a layer outside it is an error (`*err` + false), not a silent file-tier miss.
+    int64_t layer_lb = 0;
+    /// SPLIT: one past the last model layer this tier serves.  0 = all of them (today).
+    int64_t layer_le = 0;
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
     static constexpr int kMaxPf = 6;    ///< prefetch staging slots (the DMA window of one layer)
@@ -398,7 +434,8 @@ public:
     /// the routing profile, or with every (layer, expert) in index order by a caller that has none; public so a
     /// test can force it.  The first build wins: a second call with a ranking after a ranked build is a no-op
     /// (the same rule the cache follows, where the first seed takes the free slots), so a re-seed re-fills the
-    /// cache and never re-reads the arena.
+    /// cache and never re-reads the arena.  With a layer range set (slice B) only the pairs inside
+    /// [layer_lb, layer_le) are admitted; the rest of the ranking is left for the tier that owns those layers.
     bool build_arena(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
     /// The RAM arena alone, in the order seed_from_ranked gives it (that seed then only opens + fills the VRAM cache)
     bool build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
@@ -411,40 +448,52 @@ public:
     /// Ranks every (layer, expert) by routing frequency over the TRAIN half of a `ds4routes.bin` file
     /// (alternating 512-token blocks - the split `tools/ds4/route_skew.py` scores with), builds the host arena
     /// from it and fills the VRAM cache with the top `slots` of it.  The format is `moe_replay.cpp`'s:
-    /// [512-token ubatch][layer][token][6] u16.
+    /// [512-token ubatch][layer][token][6] u16.  With a layer range set (slice B) the profile is global and the
+    /// seed keeps only its own layers: the arena, the cache fill and the slot sizes cover [layer_lb, layer_le)
+    /// alone, so `slots` / `slot_gib` are this tier's budget, not the model's.
     bool seed_from_routes(const std::string& routes_bin, std::string& err);
     /// The same for route files with `batch_tokens`-token ubatches (tools/mimo/route_probe writes 2048) and only the
     /// routed layers in them (`Ds41MoeGeom::n_routed()` per token).
     bool seed_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err);
-    /// The same fill from an already-ranked list (the arena and the gate both have one to hand).
+    /// The same fill from an already-ranked list (the arena and the gate both have one to hand).  The layer-range
+    /// rule of `seed_from_routes` applies.
     bool seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
 
     /// Issues, asynchronously, the DMAs for up to `pf_b` of `top16`'s experts that are not resident, into this
     /// layer's staging slots.  Call it after the router prediction for `layer` and BEFORE the layer's dense GPU
     /// work; `run(layer, ...)` consumes what it staged and clears the staging.  No-op in `cpu_only` and when
-    /// `pf_b <= 0`.  `n` may be smaller than the caller's list; never larger than kPredW.
+    /// `pf_b <= 0`, and for a `layer` outside the tier's range (slice B) - a hint, so out-of-range is a no-op.
+    /// `n` may be smaller than the caller's list; never larger than kPredW.
     void prefetch(int64_t layer, const int32_t* top16, int n = Ds41MoeConfig::kPredW);
     /// The multi-token verify pass's prefetch (call before attn_router(layer), so the DMAs run under its attention):
     /// `ids` = ranked candidate experts (best first, may repeat), the first `max_slots` (<= kMaxPf) that are neither
     /// VRAM-resident nor outside the arena are DMA'd into the prefetch slots on the prefetch stream; run_multi_to_dev
-    /// computes a routed one from its slot (a hit).  Independent of pf_b.  A hint only: results do not depend on it.
+    /// computes a routed one from its slot (a hit).  Independent of pf_b.  A hint only: results do not depend on
+    /// it; a `layer` outside the tier's range (slice B) is a no-op.
     void prefetch_multi(int64_t layer, const int32_t* ids, int n, int max_slots);
     /// Decode file-tier readahead: for the predicted experts of `layer` that are neither VRAM-resident nor in the RAM
     /// arena, ask the kernel to read their bytes into the page cache now (posix_fadvise WILLNEED), so the tier's
     /// buffered read later is a page-cache copy.  The SSD is otherwise idle in decode, so a wrong guess costs ~nothing.
+    /// A `layer` outside the tier's range (slice B) is a no-op.
     void advise_file(int64_t layer, const int32_t* ids, int n);
     /// Decode speculative reads: start O_DIRECT reads of `ids` (a later layer's predicted experts) that are neither
-    /// VRAM-resident nor in the arena into a pinned stash; that layer's run takes them from there.  A hint only.
+    /// VRAM-resident nor in the arena into a pinned stash; that layer's run takes them from there.  A hint only;
+    /// a `layer` outside the tier's range (slice B) is a no-op.
     void spec_read(int64_t layer, const int32_t* ids, int n, bool d3 = false);
 
     /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.
-    bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out);
+    /// With a layer range set (cfg.layer_lb/layer_le), a `layer` outside [layer_lb, layer_le) is refused - false,
+    /// and `*err` when `err` is given - instead of silently falling to the file tier (slice B).  No range: every
+    /// routed layer, exactly as before.
+    bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out, std::string* err = nullptr);
     /// `run` with the weighted sum computed on the card and written to the device row `out_dev` (n_embd floats, e.g.
     /// the dense half's routed tensor): the same bits as `run`'s host sum, without its parts readback and upload.
-    /// GPU tier only (false in cpu_only).
-    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev);
-    /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
-    bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
+    /// GPU tier only (false in cpu_only).  `out_dev` must live on the tier's device (cfg.device; any device when
+    /// unset - the copy out of the tier's buffers is a same-device copy, not a peer transfer).
+    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev, std::string* err = nullptr);
+    /// The same with `x` already on the device (the engine's attention output; same device as the tier, as
+    /// `out_dev`).  CUDA modes only.
+    bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out, std::string* err = nullptr);
 
     void close();
 
@@ -467,10 +516,13 @@ public:
     bool in_arena(int64_t layer, int64_t expert) const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
-    bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
+    /// The layer-range rule of `run` applies.
+    bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out, std::string* err = nullptr);
     /// run_multi writing the nt * n_embd sums to device memory `out_dev` instead of the host (D3: the verify pass's
     /// per-token routed rows, one call per layer).  nt*top_k token-major ids/w, x nt*n_embd.  GPU tier only.
-    bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// `out_dev` must live on the tier's device (cfg.device; any device when unset) - same-device contract, as
+    /// `run_to_dev`.
+    bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev, std::string* err = nullptr);
     /// Measurement only (session 13): open a binary routing trace.  Writes a header snapshot (per (layer, expert):
     /// class, VRAM-resident, in arena), then one record per run_multi_to_dev call (the verify path): its distinct
     /// experts with the first pass row routing each and the class the call served it as.  `trace_mark` appends a
@@ -482,10 +534,11 @@ public:
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
     /// tier: every expert on the card - resident from its slot, the rest streamed once per chunk (MiMo prefill;
     /// MIMO_CHUNK_STAGE_MIB sizes the two streaming halves, default 1024).  CPU tier: token by token.
-    bool run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out);
-    /// run_chunk writing the n * n_embd sums to device memory `out_dev` (same device, e.g. the dense half's chunk
-    /// tensor) instead of the host.  GPU tier only.
-    bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// The layer-range rule of `run` applies.
+    bool run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out, std::string* err = nullptr);
+    /// run_chunk writing the n * n_embd sums to device memory `out_dev` (same device as the tier - cfg.device,
+    /// e.g. the dense half's chunk tensor on the same card - as `run_to_dev`) instead of the host.  GPU tier only.
+    bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev, std::string* err = nullptr);
     /// The arena alone from a routing profile (the order `seed_from_routes` would give it, incl. arena_skip_resident),
     /// WITHOUT opening the VRAM cache - so prompt chunks can run first and `release_chunk` can give their buffers back
     /// before the cache takes the VRAM.  A later `seed_from_routes` keeps this arena and only seeds the cache.

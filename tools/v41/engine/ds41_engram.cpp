@@ -1,5 +1,6 @@
 // tools/v41/engine/ds41_engram.cpp - see ds41_engram.hpp.
 #include "ds41_engram.hpp"
+#include "strata/artifact/dequant.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -180,7 +181,7 @@ Ds41Engram::~Ds41Engram() {
     for (auto & t : workers_) t.join();
     for (auto & t : tables_) {
         if (t.fd_w >= 0) ::close(t.fd_w);
-        if (t.fd_s >= 0) ::close(t.fd_s);
+        if (t.fd_s >= 0 && t.fd_s != t.fd_w) ::close(t.fd_s);   // GGUF (and a same-file HF pair): one fd, closed once
     }
 }
 
@@ -230,19 +231,108 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
             (k ? t.rm_s : t.rm_w) = raw_map(path, fd);
             t.rows = rows;
         }
+        t.row_bytes = dim_ + dim_ / 32;   // two spans: dim weight bytes + dim/32 scale bytes
         tables_.push_back(t);
     }
+    setup_pool_cache(threads);
+    return true;
+}
+
+// Rows straight out of the model GGUF: each Engram layer's table is the file's own blk.N.engram_embd.weight, a Q8_0
+// or Q6_K tensor of shape [dim, rows] (dim 256 -> 272 / 210-byte rows). Same row cache / coalescing / pool as the
+// HF path; only the source (one fd = the shard, row bytes, decode) differs. rows_limit (0 = the tensor's own row
+// count) caps the readable rows for partial / dev files: hashed rows at or past the cap read as zeros, never touch
+// the fd, and never count as failed reads.  The primes-tile-the-table invariant is ds41_read_geometry's check
+// against the tensor's true row count, not the cap.
+bool Ds41Engram::open_gguf(const Ds41Geometry & g, const GgufModel & m, int64_t rows_limit, int threads, std::string & err) {
+    g_ = &g;
+    cols_ = (g.engram_ngram - 1) * g.engram_heads;
+    dim_ = g.engram_dim;
+    const int64_t nel = (int64_t) g.engram_layers.size();
+    offsets_.assign((size_t) (nel * cols_), 0);
+    for (int64_t e = 0; e < nel; ++e) {
+        uint64_t acc = 0;
+        for (int64_t c = 0; c < cols_; ++c) {
+            offsets_[(size_t) (e * cols_ + c)] = (int64_t) acc;
+            acc += g.engram_primes[(size_t) (e * cols_ + c)];
+        }
+    }
+    for (int64_t e = 0; e < nel; ++e) {
+        const std::string name = "blk." + std::to_string(g.engram_layers[(size_t) e]) + ".engram_embd.weight";
+        size_t si = 0;
+        const TensorInfo * ti = m.find(name, &si);
+        if (!ti) { err = "engram: " + name + " not in the model GGUF"; return false; }
+        if (ti->type != ty::Q8_0 && ti->type != ty::Q6_K) {
+            err = "engram: " + name + " is " + ti->type_name() + ", not Q8_0 or Q6_K";
+            return false;
+        }
+        if (ti->shape.size() != 2 || (int64_t) ti->shape[0] != dim_) {
+            err = "engram: " + name + " has an unexpected shape";
+            return false;
+        }
+        Table t;
+        block_geometry(ti->type, t.block_elems, t.block_bytes);
+        if (dim_ <= 0 || dim_ % t.block_elems) {
+            err = "engram: " + name + " needs dim a multiple of " + std::to_string(t.block_elems);
+            return false;
+        }
+        const int64_t row_bytes = dim_ / t.block_elems * t.block_bytes;   // exact ggml block row size
+        t.dequantize = ti->type == ty::Q8_0 ? dequantize_q8_0 : dequantize_q6_K;
+        const int64_t rows_true = (int64_t) ti->shape[1];
+        const uint64_t payload = m.shard(si).data_start() + ti->offset;
+        if (m.shard(si).file_size() - payload < (uint64_t) rows_true * (uint64_t) row_bytes) {
+            err = "engram: " + name + " is truncated: " + std::to_string(rows_true) + " rows x " +
+                  std::to_string(row_bytes) + " B do not fit in shard " + std::to_string(si + 1);
+            return false;
+        }
+        const int fd = ::open(m.shard(si).path().c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) { err = "engram: cannot open " + m.shard(si).path(); return false; }
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);   // buffered preads, like the HF path (rm null -> tread preads)
+        t.fd_w = t.fd_s = fd;
+        t.off_w = t.off_s = payload;
+        t.row_bytes = row_bytes;
+        t.gguf = true;
+        t.clamp = true;   // hashed rows at or past the readable count read as zeros (the tiling invariant keeps a
+                          // full table from ever reaching that; only a cap can)
+        t.rows = rows_true;
+        if (rows_limit > 0 && rows_limit < rows_true) {
+            t.rows = rows_limit;
+            std::fprintf(stderr, "engram: %s: capping readable rows at %lld of %lld (rows_limit)\n", name.c_str(),
+                         (long long) rows_limit, (long long) rows_true);
+        }
+        tables_.push_back(t);
+        std::fprintf(stderr, "engram: %s: %lld %s rows (%lld B each) read straight from shard %lld of the model file\n",
+                     name.c_str(), (long long) t.rows, ti->type_name(), (long long) t.row_bytes, (long long) (si + 1));
+    }
+    setup_pool_cache(threads);
+    return true;
+}
+
+void Ds41Engram::setup_pool_cache(int threads) {
     for (int i = 0; i < std::max(1, threads); ++i)       // the pool is the disk's queue depth
         workers_.emplace_back([this] { pump(); });
     nthreads_ = (int64_t) workers_.size();
-    {
-        const char * env = std::getenv("STRATA_ENGRAM_CACHE_ROWS");
-        cache_cap_ = env ? (size_t) std::atoll(env) : (size_t) 2000000;
-        cache_pool_.assign(cache_cap_ * (size_t) (dim_ + dim_ / 32), 0);
-        cache_idx_.reserve(cache_cap_);
-        cache_used_ = 0;
+    const char * env = std::getenv("STRATA_ENGRAM_CACHE_ROWS");
+    cache_cap_ = env ? (size_t) std::atoll(env) : (size_t) 2000000;
+    size_t max_row_bytes = 0;
+    for (const Table & t : tables_) max_row_bytes = std::max(max_row_bytes, (size_t) t.row_bytes);
+    cache_pool_.assign(cache_cap_ * max_row_bytes, 0);
+    cache_idx_.reserve(cache_cap_);
+    cache_used_ = cache_bytes_used_ = 0;
+}
+
+// One raw row -> dim floats: HF = fp8 * 2^(e8m0 - 127) per 32; GGUF uses the table's portable ggml decoder.
+void Ds41Engram::decode_row(const Table & table, const uint8_t * raw, float * out) const {
+    if (table.gguf) {
+        for (int64_t q = 0; q < dim_ / table.block_elems; ++q)
+            table.dequantize(raw + q * table.block_bytes, out + q * table.block_elems);
+        return;
     }
-    return true;
+    const uint8_t * w = raw, * s = raw + dim_;
+    for (int64_t q = 0; q < dim_ / 32; ++q) {
+        const float f = std::ldexp(1.0f, (int) s[q] - 127);
+        for (int64_t x = 0; x < 32; ++x) out[q * 32 + x] = fp8_e4m3(w[q * 32 + x]) * f;
+    }
 }
 
 void Ds41Engram::set_token(int64_t pos, int tid) {
@@ -298,23 +388,26 @@ bool Ds41Engram::rows_reference(int64_t pos0, int n, std::vector<std::vector<flo
     std::atomic<int> bad { 0 };
     std::atomic<uint64_t> bytes { 0 };
     const std::function<void(int64_t, int64_t)> fn = [&](int64_t a, int64_t b) {
-        uint8_t w[512], s[16];
+        thread_local std::vector<uint8_t> raw;
+        size_t max_row_bytes = 0;
+        for (const Table & t : tables_) max_row_bytes = std::max(max_row_bytes, (size_t) t.row_bytes);
+        raw.resize(max_row_bytes);   // reuse one buffer per worker, never allocate per row
         for (int64_t j = a; j < b; ++j) {
             const int64_t e = j / (n * cols_);
             const Table & T = tables_[(size_t) e];
             const int64_t r = ids[(size_t) j];
-            if (r < 0 || r >= T.rows ||
-                ::pread(T.fd_w, w, (size_t) dim_, (off_t) (T.off_w + (uint64_t) r * (uint64_t) dim_)) != (ssize_t) dim_ ||
-                ::pread(T.fd_s, s, (size_t) (dim_ / 32), (off_t) (T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) != (ssize_t) (dim_ / 32)) {
+            if (r < 0 || r >= T.rows) { if (!T.clamp) bad.fetch_add(1); continue; }   // clamped: the row is zeros
+            if (T.gguf) {
+                if (::pread(T.fd_w, raw.data(), (size_t) T.row_bytes, (off_t) (T.off_w + (uint64_t) r * (uint64_t) T.row_bytes)) !=
+                    (ssize_t) T.row_bytes) { bad.fetch_add(1); continue; }
+            } else if (::pread(T.fd_w, raw.data(), (size_t) dim_, (off_t) (T.off_w + (uint64_t) r * (uint64_t) dim_)) != (ssize_t) dim_ ||
+                       ::pread(T.fd_s, raw.data() + dim_, (size_t) (dim_ / 32), (off_t) (T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) !=
+                           (ssize_t) (dim_ / 32)) {
                 bad.fetch_add(1);
                 continue;
             }
-            bytes.fetch_add((uint64_t) (dim_ + dim_ / 32));
-            float * o = &out[(size_t) e][(size_t) ((j % (n * cols_)) * dim_)];
-            for (int64_t q = 0; q < dim_ / 32; ++q) {
-                const float sc = std::ldexp(1.0f, (int) s[q] - 127);
-                for (int64_t i = 0; i < 32; ++i) o[q * 32 + i] = fp8_e4m3(w[q * 32 + i]) * sc;
-            }
+            bytes.fetch_add((uint64_t) T.row_bytes);
+            decode_row(T, raw.data(), &out[(size_t) e][(size_t) ((j % (n * cols_)) * dim_)]);
         }
     };
     parallel(total, fn);
@@ -325,7 +418,9 @@ bool Ds41Engram::rows_reference(int64_t pos0, int n, std::vector<std::vector<flo
 
 // One sorted, page-coalesced read: the unique rows uniq[u0 .. u0+count) all have their weight bytes inside one 4 KiB page
 // (so [off_w, off_w+len_w) is the exact byte span, one pread), and their scale bytes span [off_s, off_s+len_s) (a second).
-// The group dequantizes each row straight into its output slots - no intermediate buffer, no second pass.
+// GGUF tables (open_gguf): a row is one quantized blob, so the weight read already covers it and the scale span is
+// empty (len_s = 0, no second pread).  The group dequantizes each row straight into its output slots - no intermediate
+// buffer, no second pass.
 struct Ds41Engram::ReadGroup {
     int64_t e = 0;                    // layer slot (indexes the batch's per-layer state)
     uint64_t off_w = 0, off_s = 0;    // weight / scale byte spans
@@ -391,7 +486,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
         auto & rb = b->run_begin[(size_t) e];
         for (int64_t p = 0; p < m; ++p) {
             const uint32_t r = (uint32_t) (pk[(size_t) p] >> 32);
-            if ((uint64_t) r >= (uint64_t) T.rows) b->bad.fetch_add(1);
+            if ((uint64_t) r >= (uint64_t) T.rows && !T.clamp) b->bad.fetch_add(1);   // clamped (rows_limit): reads as zeros
             if (rb.empty() || uq.back() != r) { uq.push_back(r); rb.push_back((uint32_t) p); }
         }
         rb.push_back((uint32_t) m);
@@ -407,13 +502,9 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 if (it == cache_idx_.end()) { ++cache_miss_; continue; }
                 ++cache_hits_;
                 hit[k] = 1;
-                const uint8_t * w = &cache_pool_[(size_t) it->second * (size_t) (dim + srsz)];
-                const uint8_t * sc = w + dim;
+                const uint8_t * raw = &cache_pool_[it->second];
                 float * o0 = oe + (size_t) (uint32_t) pk[rb[k]] * (size_t) dim;
-                for (int64_t q = 0; q < srsz; ++q) {
-                    const float f = std::ldexp(1.0f, (int) sc[q] - 127);
-                    for (int64_t x = 0; x < 32; ++x) o0[q * 32 + x] = fp8_e4m3(w[q * 32 + x]) * f;
-                }
+                decode_row(T, raw, o0);
                 for (uint32_t p = rb[k] + 1; p < rb[k + 1]; ++p)
                     std::memcpy(oe + (size_t) (uint32_t) pk[p] * (size_t) dim, o0, (size_t) dim * sizeof(float));
             }
@@ -421,15 +512,16 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
         size_t i = 0;
         while (i < u) {
             if ((uint64_t) uq[i] >= (uint64_t) T.rows || hit[i]) { ++i; continue; }   // out of range (bad set) / cached
-            const uint64_t pw = bw + (uint64_t) uq[i] * (uint64_t) dim;
+            const int64_t wstride = T.gguf ? T.row_bytes : dim;   // HF weight rows are dim-spaced; a GGUF row is one blob
+            const uint64_t pw = bw + (uint64_t) uq[i] * (uint64_t) wstride;
             const uint64_t page = pw & ~(uint64_t) 4095;
             size_t j = i + 1;
             while (j < u && (uint64_t) uq[j] < (uint64_t) T.rows && !hit[j] &&
-                   ((bw + (uint64_t) uq[j] * (uint64_t) dim) & ~(uint64_t) 4095) == page) ++j;
-            const uint64_t w0 = bw + (uint64_t) uq[i] * (uint64_t) dim;
-            const uint64_t w1 = bw + (uint64_t) uq[j - 1] * (uint64_t) dim + (uint64_t) dim;
-            const uint64_t s0 = bs + (uint64_t) uq[i] * (uint64_t) srsz;
-            const uint64_t s1 = bs + (uint64_t) uq[j - 1] * (uint64_t) srsz + (uint64_t) srsz;
+                   ((bw + (uint64_t) uq[j] * (uint64_t) wstride) & ~(uint64_t) 4095) == page) ++j;
+            const uint64_t w0 = bw + (uint64_t) uq[i] * (uint64_t) wstride;
+            const uint64_t w1 = bw + (uint64_t) uq[j - 1] * (uint64_t) wstride + (uint64_t) wstride;
+            const uint64_t s0 = T.gguf ? 0 : bs + (uint64_t) uq[i] * (uint64_t) srsz;   // GGUF: the row is one blob, the
+            const uint64_t s1 = T.gguf ? 0 : bs + (uint64_t) uq[j - 1] * (uint64_t) srsz + (uint64_t) srsz;   // weight read already covers it
             b->groups.push_back(ReadGroup{ e, w0, s0, (uint32_t) (w1 - w0), (uint32_t) (s1 - s0), (uint32_t) i, (uint32_t) (j - i) });
             i = j;
         }
@@ -446,8 +538,8 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 const Table & T = tables_[(size_t) G.e];
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
                     tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w) != (ssize_t) G.len_w ||
-                    tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); continue; }
-                bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
+                    (!T.gguf && tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s)) { bp->bad.fetch_add(1); continue; }
+                bp->bytes.fetch_add((uint64_t) G.len_w + (T.gguf ? 0 : G.len_s));
                 const auto & uq = bp->uniq[(size_t) G.e];
                 const auto & pk = bp->packed[(size_t) G.e];
                 const auto & rb = bp->run_begin[(size_t) G.e];
@@ -456,22 +548,28 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 for (uint32_t k = 0; k < G.count; ++k) {
                     const uint32_t uu = G.u0 + k;
                     const uint32_t row = uq[uu];
-                    const uint8_t * w = bw + (uint64_t) (row - r0) * (uint64_t) dim;
-                    const uint8_t * s = bs + (uint64_t) (row - r0) * (uint64_t) srsz;
-                    if (cache_cap_ && cache_used_ < cache_cap_) {   // keep the raw row (fill-until-full)
+                    const int64_t wstride = T.gguf ? T.row_bytes : dim;
+                    const uint8_t * w = bw + (uint64_t) (row - r0) * (uint64_t) wstride;   // HF: the weight bytes; GGUF: the row
+                    const uint8_t * s = bs + (uint64_t) (row - r0) * (uint64_t) srsz;   // HF scale
+                    if (cache_cap_) {   // keep the raw row (fill-until-full), packed at its own byte stride
                         std::lock_guard<std::mutex> lk(cache_mu_);
-                        if (cache_used_ < cache_cap_ && cache_idx_.emplace(((uint64_t) G.e << 32) | row, (uint32_t) cache_used_).second) {
-                            uint8_t * d = &cache_pool_[cache_used_ * (size_t) (dim + srsz)];
-                            std::memcpy(d, w, (size_t) dim);
-                            std::memcpy(d + dim, s, (size_t) srsz);
+                        if (cache_used_ < cache_cap_ && cache_idx_.emplace(((uint64_t) G.e << 32) | row, cache_bytes_used_).second) {
+                            uint8_t * d = &cache_pool_[cache_bytes_used_];
+                            if (T.gguf) std::memcpy(d, w, (size_t) T.row_bytes);
+                            else { std::memcpy(d, w, (size_t) dim); std::memcpy(d + dim, s, (size_t) srsz); }
                             ++cache_used_;
+                            cache_bytes_used_ += (size_t) T.row_bytes;
                         }
                     }
                     const uint32_t p0 = rb[uu];
                     float * o0 = oe + (size_t) (uint32_t) pk[p0] * (size_t) dim;   // dequantize straight into the first slot
-                    for (int64_t q = 0; q < srsz; ++q) {
-                        const float sc = std::ldexp(1.0f, (int) s[q] - 127);
-                        for (int64_t x = 0; x < 32; ++x) o0[q * 32 + x] = fp8_e4m3(w[q * 32 + x]) * sc;
+                    if (T.gguf) {
+                        decode_row(T, w, o0);
+                    } else {
+                        for (int64_t q = 0; q < srsz; ++q) {
+                            const float sc = std::ldexp(1.0f, (int) s[q] - 127);
+                            for (int64_t x = 0; x < 32; ++x) o0[q * 32 + x] = fp8_e4m3(w[q * 32 + x]) * sc;
+                        }
                     }
                     for (uint32_t p = p0 + 1; p < rb[uu + 1]; ++p)               // ... and share it with the row's other slots
                         std::memcpy(oe + (size_t) (uint32_t) pk[p] * (size_t) dim, o0, (size_t) dim * sizeof(float));

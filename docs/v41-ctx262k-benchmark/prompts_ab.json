@@ -1,0 +1,800 @@
+{
+  "created_utc": "2026-10-18T08:50:30.665394+00:00",
+  "purpose": "persistent-server repeated prefill/decode A/B: MTP/DSpark on vs off",
+  "repo": "/home/neron/projects/xolotl",
+  "tokenizer_dir": "/home/neron/models/Deepseek-V41-GSQ/tokenizer",
+  "tokenizer_vocab": 129280,
+  "source_files": [
+    "/home/neron/projects/xolotl/README.md",
+    "/home/neron/projects/xolotl/docs/DEEPSEEK_V41.md",
+    "/home/neron/projects/xolotl/docs/xolotl/BENCHMARKS.md",
+    "/home/neron/projects/xolotl/docs/MULTI_GPU.md",
+    "/home/neron/projects/xolotl/docs/DETAILS.md",
+    "/home/neron/projects/xolotl/docs/BATCHING.md",
+    "/home/neron/projects/xolotl/docs/INSTALL.md",
+    "/home/neron/projects/xolotl/docs/HOW_IT_WORKS.md",
+    "/home/neron/projects/xolotl/docs/QUANTS.md",
+    "/home/neron/projects/xolotl/docs/VRAM_ELASTIC.md",
+    "/home/neron/projects/xolotl/tools/v41/hf/README.md",
+    "/home/neron/projects/xolotl/tools/v41/DSPARK_SHRINK.md"
+  ],
+  "source_corpus_tokens": 81256,
+  "source_corpus_sha256": "721eea2286af04e922862c42c325ad7cbf9b8136d9de83d75c9485c853c4fb78",
+  "prompt_template": "DeepSeek V4.1 chat template; exhaustive response; greedy decode (temperature=0)",
+  "launcher": "/home/neron/projects/xolotl/docs/v41-local-benchmark/run_engine_fg.sh",
+  "protocol_source": "/home/neron/projects/xolotl/tools/v41/engine/ds41_generate.cpp",
+  "protocol": "GEN <max_new> temperature=0 <ids csv> | STOP | QUIT",
+  "reps_per_cell_per_arm": 3,
+  "warmup_per_arm": 2,
+  "fixture_policy": {
+    "measured_fixtures": 18,
+    "measured_pairwise_distinct": true,
+    "measured_disjoint_from_warmup": true,
+    "warmup_requests_share_one_fixture": true,
+    "fixture_ids_identical_between_arms": true,
+    "template_prefix_reuse_tokens": 2,
+    "measured_reuse_expectation": "== template_prefix_reuse_tokens (no fixture-level reuse); a literal 0 is impossible in the persistent server because of the shared chat-template prefix"
+  },
+  "schedule": {
+    "cells_in_order": [
+      {
+        "prefill_tokens": 1024,
+        "max_new_tokens": 128
+      },
+      {
+        "prefill_tokens": 1024,
+        "max_new_tokens": 256
+      },
+      {
+        "prefill_tokens": 2048,
+        "max_new_tokens": 128
+      },
+      {
+        "prefill_tokens": 2048,
+        "max_new_tokens": 256
+      },
+      {
+        "prefill_tokens": 4096,
+        "max_new_tokens": 128
+      },
+      {
+        "prefill_tokens": 4096,
+        "max_new_tokens": 256
+      }
+    ],
+    "order_rule": "deterministic balanced rotation: generation g uses offset (2*g) mod 6; identical for both arms",
+    "rotation_offsets": [
+      0,
+      2,
+      4
+    ],
+    "generation": "one pass over the six cells in the generation's rotated order",
+    "generation_schedule": [
+      [
+        {
+          "generation": 1,
+          "position": 1,
+          "case": "pp1024_out128.rep1"
+        },
+        {
+          "generation": 1,
+          "position": 2,
+          "case": "pp1024_out256.rep1"
+        },
+        {
+          "generation": 1,
+          "position": 3,
+          "case": "pp2048_out128.rep1"
+        },
+        {
+          "generation": 1,
+          "position": 4,
+          "case": "pp2048_out256.rep1"
+        },
+        {
+          "generation": 1,
+          "position": 5,
+          "case": "pp4096_out128.rep1"
+        },
+        {
+          "generation": 1,
+          "position": 6,
+          "case": "pp4096_out256.rep1"
+        }
+      ],
+      [
+        {
+          "generation": 2,
+          "position": 1,
+          "case": "pp2048_out128.rep2"
+        },
+        {
+          "generation": 2,
+          "position": 2,
+          "case": "pp2048_out256.rep2"
+        },
+        {
+          "generation": 2,
+          "position": 3,
+          "case": "pp4096_out128.rep2"
+        },
+        {
+          "generation": 2,
+          "position": 4,
+          "case": "pp4096_out256.rep2"
+        },
+        {
+          "generation": 2,
+          "position": 5,
+          "case": "pp1024_out128.rep2"
+        },
+        {
+          "generation": 2,
+          "position": 6,
+          "case": "pp1024_out256.rep2"
+        }
+      ],
+      [
+        {
+          "generation": 3,
+          "position": 1,
+          "case": "pp4096_out128.rep3"
+        },
+        {
+          "generation": 3,
+          "position": 2,
+          "case": "pp4096_out256.rep3"
+        },
+        {
+          "generation": 3,
+          "position": 3,
+          "case": "pp1024_out128.rep3"
+        },
+        {
+          "generation": 3,
+          "position": 4,
+          "case": "pp1024_out256.rep3"
+        },
+        {
+          "generation": 3,
+          "position": 5,
+          "case": "pp2048_out128.rep3"
+        },
+        {
+          "generation": 3,
+          "position": 6,
+          "case": "pp2048_out256.rep3"
+        }
+      ]
+    ],
+    "measured_requests_per_arm": 18
+  },
+  "arms": {
+    "mtp": "STRATA_SERVE_DSPARK=/home/neron/models/Deepseek-V41-GSQ/V41-MTP-Vision.Q2_K.gguf (explicit local Q2_K sidecar; the launcher would otherwise default to the Mal path /media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.Q2_K.gguf); DSpark defaults DEPTH 4, KEEP file:64, the launcher's CONF/LOOKUP/EVICT - not overridden",
+    "nomtp": "STRATA_SERVE_DSPARK= (EMPTY) so run_engine_fg.sh unsets it at exec - the control arm runs without drafts; the only other difference is the engine restart"
+  },
+  "requests": [
+    {
+      "case": "pp1024_out128.rep1",
+      "base_case": "pp1024_out128",
+      "phase": "measure",
+      "prefill_tokens": 1024,
+      "max_new_tokens": 128,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp1024_out128.rep1.i32",
+      "ids_sha256": "9686233c7dd410c4473b0f776cc09add29b26169f53a567a9c303ab4bc9cea34",
+      "prompt_id_count": 1024,
+      "first_ids": [
+        0,
+        128803,
+        4100,
+        113614,
+        344,
+        260,
+        35312,
+        2352
+      ],
+      "last_ids": [
+        58,
+        331,
+        347,
+        78,
+        12,
+        344,
+        128804,
+        128822
+      ],
+      "rep": 1
+    },
+    {
+      "case": "pp1024_out128.rep2",
+      "base_case": "pp1024_out128",
+      "phase": "measure",
+      "prefill_tokens": 1024,
+      "max_new_tokens": 128,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp1024_out128.rep2.i32",
+      "ids_sha256": "6caf50db46083cd8f5322f1d638dd3411b138546b190044f11db67b9fdf8737c",
+      "prompt_id_count": 1024,
+      "first_ids": [
+        0,
+        128803,
+        4100,
+        113614,
+        344,
+        260,
+        35312,
+        2352
+      ],
+      "last_ids": [
+        70765,
+        223,
+        1557,
+        16,
+        27,
+        2619,
+        128804,
+        128822
+      ],
+      "rep": 2
+    },
+    {
+      "case": "pp1024_out128.rep3",
+      "base_case": "pp1024_out128",
+      "phase": "measure",
+      "prefill_tokens": 1024,
+      "max_new_tokens": 128,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp1024_out128.rep3.i32",
+      "ids_sha256": "0013ff3d565f089d871fd131a297f800e7fd1b46ec86afcb41aefb31db2c6e71",
+      "prompt_id_count": 1024,
+      "first_ids": [
+        0,
+        128803,
+        4100,
+        113614,
+        344,
+        260,
+        35312,
+        2352
+      ],
+      "last_ids": [
+        1234,
+        9581,
+        38593,
+        47520,
+        666,
+        343,
+        128804,
+        128822
+      ],
+      "rep": 3
+    },
+    {
+      "case": "pp1024_out256.rep1",
+      "base_case": "pp1024_out256",
+      "phase": "measure",
+      "prefill_tokens": 1024,
+      "max_new_tokens": 256,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp1024_out256.rep1.i32",
+      "ids_sha256": "709e9a4408259f47cb1e6c8807a284ba3cc94b6fdf4bd7a8b2ad73f62e707273",
+      "prompt_id_count": 1024,
+      "first_ids": [
+        0,
+        128803,
+        44,
+        20809,
+        567,
+        344,
+        260,
+        35312
+      ],
+      "last_ids": [
+        1469,
+        18902,
+        12122,
+        28,
+        778,
+        13523,
+        128804,
+        128822
+      ],
+      "rep": 1
+    },
+    {
+      "case": "pp1024_out256.rep2",
+      "base_case": "pp1024_out256",
+      "phase": "measure",
+      "prefill_tokens": 1024,
+      "max_new_tokens": 256,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp1024_out256.rep2.i32",
+      "ids_sha256": "a5f55550775588d398713cea05ccd078ca946e52f1b756b81f56f8aee7d13db6",
+      "prompt_id_count": 1024,
+      "first_ids": [
+        0,
+        128803,
+        44,
+        20809,
+        567,
+        344,
+        260,
+        35312
+      ],
+      "last_ids": [
+        28333,
+        6803,
+        304,
+        411,
+        7728,
+        14414,
+        128804,
+        128822
+      ],
+      "rep": 2
+    },
+    {
+      "case": "pp1024_out256.rep3",
+      "base_case": "pp1024_out256",
+      "phase": "measure",
+      "prefill_tokens": 1024,
+      "max_new_tokens": 256,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp1024_out256.rep3.i32",
+      "ids_sha256": "ddb47066a19756ce36f903d5688ee649052f258040947513ff525f049f4d7144",
+      "prompt_id_count": 1024,
+      "first_ids": [
+        0,
+        128803,
+        44,
+        20809,
+        567,
+        344,
+        260,
+        35312
+      ],
+      "last_ids": [
+        64285,
+        377,
+        260,
+        2041,
+        4940,
+        343,
+        128804,
+        128822
+      ],
+      "rep": 3
+    },
+    {
+      "case": "pp2048_out128.rep1",
+      "base_case": "pp2048_out128",
+      "phase": "measure",
+      "prefill_tokens": 2048,
+      "max_new_tokens": 128,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp2048_out128.rep1.i32",
+      "ids_sha256": "bc99273c02f05a313012812213399665967dfe123eff4550ac800bac5aefb3e0",
+      "prompt_id_count": 2048,
+      "first_ids": [
+        0,
+        128803,
+        53,
+        3871,
+        1867,
+        344,
+        260,
+        35312
+      ],
+      "last_ids": [
+        14,
+        16256,
+        223,
+        10092,
+        16,
+        20,
+        128804,
+        128822
+      ],
+      "rep": 1
+    },
+    {
+      "case": "pp2048_out128.rep2",
+      "base_case": "pp2048_out128",
+      "phase": "measure",
+      "prefill_tokens": 2048,
+      "max_new_tokens": 128,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp2048_out128.rep2.i32",
+      "ids_sha256": "35e5ef527365e480cc001169b977bfb20f8e5f6736677983fa280d3370ed07ef",
+      "prompt_id_count": 2048,
+      "first_ids": [
+        0,
+        128803,
+        53,
+        3871,
+        1867,
+        344,
+        260,
+        35312
+      ],
+      "last_ids": [
+        78141,
+        18490,
+        294,
+        270,
+        1234,
+        11304,
+        128804,
+        128822
+      ],
+      "rep": 2
+    },
+    {
+      "case": "pp2048_out128.rep3",
+      "base_case": "pp2048_out128",
+      "phase": "measure",
+      "prefill_tokens": 2048,
+      "max_new_tokens": 128,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp2048_out128.rep3.i32",
+      "ids_sha256": "29a7eb09179c2714429fd6de91c3fee9f43acf8f1f27e761b5131f2b8997a825",
+      "prompt_id_count": 2048,
+      "first_ids": [
+        0,
+        128803,
+        53,
+        3871,
+        1867,
+        344,
+        260,
+        35312
+      ],
+      "last_ids": [
+        14,
+        9120,
+        448,
+        17121,
+        47,
+        53386,
+        128804,
+        128822
+      ],
+      "rep": 3
+    },
+    {
+      "case": "pp2048_out256.rep1",
+      "base_case": "pp2048_out256",
+      "phase": "measure",
+      "prefill_tokens": 2048,
+      "max_new_tokens": 256,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp2048_out256.rep1.i32",
+      "ids_sha256": "3fc00fcaff52ef9ed57da134192f2e46e96c893145971b8ca4bbd31933924a2b",
+      "prompt_id_count": 2048,
+      "first_ids": [
+        0,
+        128803,
+        46839,
+        344,
+        260,
+        35312,
+        2352,
+        16
+      ],
+      "last_ids": [
+        12275,
+        29,
+        834,
+        2632,
+        716,
+        7931,
+        128804,
+        128822
+      ],
+      "rep": 1
+    },
+    {
+      "case": "pp2048_out256.rep2",
+      "base_case": "pp2048_out256",
+      "phase": "measure",
+      "prefill_tokens": 2048,
+      "max_new_tokens": 256,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp2048_out256.rep2.i32",
+      "ids_sha256": "631e5be207dd9c7f2967f5d213e6c6a63c0bee152bb259dd4be272620de3e543",
+      "prompt_id_count": 2048,
+      "first_ids": [
+        0,
+        128803,
+        46839,
+        344,
+        260,
+        35312,
+        2352,
+        16
+      ],
+      "last_ids": [
+        754,
+        943,
+        223,
+        22,
+        7,
+        13058,
+        128804,
+        128822
+      ],
+      "rep": 2
+    },
+    {
+      "case": "pp2048_out256.rep3",
+      "base_case": "pp2048_out256",
+      "phase": "measure",
+      "prefill_tokens": 2048,
+      "max_new_tokens": 256,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp2048_out256.rep3.i32",
+      "ids_sha256": "722308f1446c0404290559ef16265b224ffefbb7be5dc283c141f3caedbe3827",
+      "prompt_id_count": 2048,
+      "first_ids": [
+        0,
+        128803,
+        46839,
+        344,
+        260,
+        35312,
+        2352,
+        16
+      ],
+      "last_ids": [
+        260,
+        43398,
+        12625,
+        343,
+        37638,
+        1559,
+        128804,
+        128822
+      ],
+      "rep": 3
+    },
+    {
+      "case": "pp4096_out128.rep1",
+      "base_case": "pp4096_out128",
+      "phase": "measure",
+      "prefill_tokens": 4096,
+      "max_new_tokens": 128,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp4096_out128.rep1.i32",
+      "ids_sha256": "2f707e24f215e18c013132f6b3c12650107b95cbe513caa198546518b09179c2",
+      "prompt_id_count": 4096,
+      "first_ids": [
+        0,
+        128803,
+        37,
+        57153,
+        344,
+        260,
+        35312,
+        2352
+      ],
+      "last_ids": [
+        6026,
+        1473,
+        294,
+        270,
+        25454,
+        1116,
+        128804,
+        128822
+      ],
+      "rep": 1
+    },
+    {
+      "case": "pp4096_out128.rep2",
+      "base_case": "pp4096_out128",
+      "phase": "measure",
+      "prefill_tokens": 4096,
+      "max_new_tokens": 128,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp4096_out128.rep2.i32",
+      "ids_sha256": "6c801683c8ffcd01ad13093fe9c887188c5ea494fde2fce8779da1836e5d78f9",
+      "prompt_id_count": 4096,
+      "first_ids": [
+        0,
+        128803,
+        37,
+        57153,
+        344,
+        260,
+        35312,
+        2352
+      ],
+      "last_ids": [
+        8739,
+        112566,
+        14,
+        305,
+        270,
+        5466,
+        128804,
+        128822
+      ],
+      "rep": 2
+    },
+    {
+      "case": "pp4096_out128.rep3",
+      "base_case": "pp4096_out128",
+      "phase": "measure",
+      "prefill_tokens": 4096,
+      "max_new_tokens": 128,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp4096_out128.rep3.i32",
+      "ids_sha256": "9de2dd3de2b5cff32bcda95d9718765c7417f73adc7554b694bdc4778edb87b2",
+      "prompt_id_count": 4096,
+      "first_ids": [
+        0,
+        128803,
+        37,
+        57153,
+        344,
+        260,
+        35312,
+        2352
+      ],
+      "last_ids": [
+        3431,
+        5603,
+        295,
+        270,
+        3967,
+        2859,
+        128804,
+        128822
+      ],
+      "rep": 3
+    },
+    {
+      "case": "pp4096_out256.rep1",
+      "base_case": "pp4096_out256",
+      "phase": "measure",
+      "prefill_tokens": 4096,
+      "max_new_tokens": 256,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp4096_out256.rep1.i32",
+      "ids_sha256": "733bccf26ef6d6734103e44e526d19d1c5f42adaf097dd594a94acf370af11ce",
+      "prompt_id_count": 4096,
+      "first_ids": [
+        0,
+        128803,
+        16849,
+        350,
+        1129,
+        344,
+        260,
+        35312
+      ],
+      "last_ids": [
+        28828,
+        2283,
+        3171,
+        1353,
+        20941,
+        344,
+        128804,
+        128822
+      ],
+      "rep": 1
+    },
+    {
+      "case": "pp4096_out256.rep2",
+      "base_case": "pp4096_out256",
+      "phase": "measure",
+      "prefill_tokens": 4096,
+      "max_new_tokens": 256,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp4096_out256.rep2.i32",
+      "ids_sha256": "d1bb2ab69a7f53c0eab40a21463366b291d5d91365a1b9003200892903250586",
+      "prompt_id_count": 4096,
+      "first_ids": [
+        0,
+        128803,
+        16849,
+        350,
+        1129,
+        344,
+        260,
+        35312
+      ],
+      "last_ids": [
+        12444,
+        611,
+        270,
+        66511,
+        1179,
+        343,
+        128804,
+        128822
+      ],
+      "rep": 2
+    },
+    {
+      "case": "pp4096_out256.rep3",
+      "base_case": "pp4096_out256",
+      "phase": "measure",
+      "prefill_tokens": 4096,
+      "max_new_tokens": 256,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/pp4096_out256.rep3.i32",
+      "ids_sha256": "009a334cda64052b3dfa3de0914ac6ce096714f6d794e76137d97cdaa2c98245",
+      "prompt_id_count": 4096,
+      "first_ids": [
+        0,
+        128803,
+        16849,
+        350,
+        1129,
+        344,
+        260,
+        35312
+      ],
+      "last_ids": [
+        16,
+        1492,
+        8753,
+        4338,
+        12416,
+        29,
+        128804,
+        128822
+      ],
+      "rep": 3
+    }
+  ],
+  "warmup_requests": [
+    {
+      "case": "warmup",
+      "base_case": "warmup",
+      "phase": "warmup",
+      "prefill_tokens": 1024,
+      "max_new_tokens": 32,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/warmup.i32",
+      "ids_sha256": "c9087f9ea3db97fed6e765b227a403a907e3facf96530e78ae90d2a7a90688fa",
+      "prompt_id_count": 1024,
+      "first_ids": [
+        0,
+        128803,
+        29534,
+        44773,
+        344,
+        260,
+        35312,
+        2352
+      ],
+      "last_ids": [
+        11014,
+        9709,
+        11383,
+        61932,
+        9909,
+        14,
+        128804,
+        128822
+      ],
+      "index": 1
+    },
+    {
+      "case": "warmup",
+      "base_case": "warmup",
+      "phase": "warmup",
+      "prefill_tokens": 1024,
+      "max_new_tokens": 32,
+      "ids_file": "/home/neron/projects/xolotl/docs/v41-local-benchmark/prompts_ab/warmup.i32",
+      "ids_sha256": "c9087f9ea3db97fed6e765b227a403a907e3facf96530e78ae90d2a7a90688fa",
+      "prompt_id_count": 1024,
+      "first_ids": [
+        0,
+        128803,
+        29534,
+        44773,
+        344,
+        260,
+        35312,
+        2352
+      ],
+      "last_ids": [
+        11014,
+        9709,
+        11383,
+        61932,
+        9909,
+        14,
+        128804,
+        128822
+      ],
+      "index": 2
+    }
+  ]
+}

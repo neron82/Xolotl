@@ -13,6 +13,240 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
 > The earlier **DeepSeek-V4-Flash (0731)** engine is still here and documented in the second half of this README.
 > (This repo was called `Strata-DS4`; old links redirect.)
 
+## Latest (2026-10-21)
+
+- **SAGE EXL3, opt-in performance path:** `STRATA_EXL3_FAST=1` packs the RAM arena by actual class size, pipelines
+  prompt reads/copies, gathers activations on the GPU, and consumes decode prefetches. On the local RTX 3090
+  PCIe 4.0 x16 card, two 1K prompts improved from 26.4 to 126.6 tok/s and decode from 11.0 to 22.5 tok/s.
+  Exact-routing regression logits are byte-identical. See [measurements and reproduction](EXL3_PERFORMANCE.md).
+- **Maya-S 1017 text inference:** the original six GGUF shards now load without rewriting the model files.
+  The loader accepts Maya's Engram metadata aliases, maps its tokenizer-space `pad_token_id` through `token_map`,
+  uses the stored F32 folded Q/K gate directly, and reads Q6_K Engram rows on demand. Q8_0 token embeddings are
+  decoded at their actual row stride, not addressed as BF16. The CUDA expert dispatcher also registers IQ3_S
+  down projections; both Maya expert-format combinations passed the real-weight CPU/GPU reference gate.
+  The original separate-gate, BF16-embedding and Q8_0-table paths remain supported. Maya's `expert-profile.bin`
+  contains usage counts, not Xolotl's ranked `(layer, expert)` pairs: do not pass it directly to `--rank`.
+  The comparison uses the existing common GSQ rank file for both packages. Vision and MTP are not covered by
+  this text benchmark.
+- **Thinking-turn KV reuse:** DeepSeek's encoder drops an earlier answer's reasoning and changes its generation
+  marker from `<think>` to `</think>`. The common prefix therefore ends one token before the previous prompt's
+  snapshot. The server now retains that additional checkpoint, including the rolling attention and ratio-2
+  compressor rings, instead of reading the whole prompt again. The full-prompt snapshot still handles regeneration
+  without prefill. Parked conversations also restore the Engram look-back tokens. Image requests still invalidate
+  token-only reuse: identical image-token IDs do not establish identical image embeddings.
+- **Bounded cache-aware routing, opt-in:** `STRATA_RB_MAX_RANK=R` restricts residency preference to the model's
+  corrected top-R candidates; `STRATA_RB_PROTECT=P` reserves exactly P native leaders. For V4.1's six route slots,
+  at most `6-P` can be replaced, and no replacement comes from outside the top-R pool. Weights still come from the
+  unmodified `sqrt(softplus(logit))` scores, not the residency-biased selection scores. Unset/nonpositive
+  `STRATA_RB_MAX_RANK` leaves the existing routing policy unchanged. This remains lossy routing, not a guarantee
+  against repetition; `--route-bias 0 --route-bias-file 0` is the exact-routing control.
+- **Why a flat bias can damage quality:** native selection uses `sqrt(softplus(logit)) + learned correction`,
+  not a probability. A `+1.0` VRAM bonus against a `-0.6` file penalty can reverse a native score gap below 1.6.
+  Lowering the bonus to 0.8 still permits a 1.4 gap. Correct weight normalization cannot recover an expert that
+  was excluded from the six selected slots.
+
+### Maya-S versus Acrogenesis on Xolotl
+
+Both complete 1017 packages were run on the same rebuilt executable and RTX 3090 at PCI `2B:00.0`, with a
+60 GiB RAM arena, the common GSQ rank profile, `0.8 / 0.6` decode biases, q6_K dense requantization,
+`STRATA_PRESTAGE_MMQ=1`, BF16 KV storage, and no vision or MTP. The production dashboard config was not switched.
+
+The speed columns are means of two fresh-KV **8192-input / 512-output** one-shot runs per package, in
+Acrogenesis/Maya/Maya/Acrogenesis order. The same real-text input and forced continuation token IDs were used:
+these are fixed-stream compute-throughput measurements, not unconstrained answers or HTTP request latency.
+Prefill and decode exclude model loading and VRAM cache seeding. Decode uses the engine's `(output_tokens - 1)`
+convention because the first token comes from the prefill logits. One-shot mode retains prompt state columns;
+the production server's elastic-column behavior is different.
+
+| Package | GGUF GiB | Prefill tok/s | Decode tok/s | VRAM experts | Code PPL | Prose PPL | Thinking tasks | Chat tasks |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Acrogenesis, 10 shards | 334.64 | 355.85 | 25.19 | 1358 | 3.5966 | 6.7017 | 7/8 | 2/8 |
+| Maya-S, 6 shards | 316.16 | 310.05 | 21.65 | 1137 | 3.4698 | 6.4869 | 8/8 | 6/8 |
+
+Each PPL sample scores 1023 next-token predictions, with unbiased prompt routing, from a recorded local code or
+prose fixture. These are small local samples, not an official accuracy benchmark. Free-generation tasks use greedy
+sampling, the official template and native EOS, separately from the forced speed runs. A pass requires a normal
+stop and the entire final answer to be exactly one correct JSON object. Hidden reasoning is separated at the first
+`</think>` marker, as on the actual response surface; extra prose, malformed JSON and token-limit truncation fail.
+Thinking uses the normal effort 75 and a 2048-token budget; chat disables thinking and uses 768.
+
+Maya's total package is smaller because of the Q6_K Engram tables, but its expert blobs are larger. Equal memory
+budgets therefore do not hold equal numbers of experts; this is part of the package's cost, not per-model tuning.
+The task-score difference is not purely reasoning accuracy: Acrogenesis' thinking failure was a malformed final
+answer, and its chat failures mostly involved the requested output format, including one repeating truncated
+answer. Maya's chat arithmetic and LRU answers were wrong; all its checked thinking answers were correct.
+
+**Quality-first selection for the context grid: Maya-S.** Acrogenesis remains the speed-first choice. This small
+fixture set does not establish that either model is generally free of loops.
+
+Complete original requests, token streams, configs, raw engine logs, corrected completion-aware grading and
+package-header measurements: `~/models/benchmarks/dsv41-model-context-20261021-120653/`. The initial
+substring-only grader incorrectly counted an earlier correct JSON fragment inside extra/truncated output;
+that intermediate result is retained for provenance but is not used for the selection above.
+
+### Configured context versus speed: Maya-S
+
+Same controls and one-shot fixed-stream method as the model comparison above; **BF16 KV at every size**.
+K means 1024 tokens and M means 1048576. PP and TG are prefill and decode rates in tokens/second.
+The output-column lengths are exact, not maximum budgets that could stop early at EOS.
+
+| Context | Prefill | PP, 256 out | TG, 256 out | PP, 512 out | TG, 512 out | VRAM experts |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128K | 4K | 191.8 | 23.55 | 190.8 | 22.68 | 1302 |
+| 128K | 8K | 310.3 | 22.63 | 309.4 | 21.90 | 1175 |
+| 128K | 16K | 385.5 | 22.33 | 385.7 | 21.42 | 1042 |
+| 256K | 4K | 188.3 | 23.23 | 189.1 | 22.57 | 1264 |
+| 256K | 8K | 309.3 | 22.38 | 310.1 | 21.65 | 1137 |
+| 256K | 16K | 389.0 | 22.35 | 379.1 | 20.97 | 1005 |
+| 512K | 4K | 185.0 | 22.93 | 190.1 | 22.28 | 1190 |
+| 512K | 8K | 310.4 | 22.15 | 309.2 | 21.60 | 1062 |
+| 512K | 16K | 395.4 | 21.84 | 396.2 | 21.00 | 930 |
+| 1M | 4K | 189.1 | 22.55 | 187.2 | 21.75 | 1040 |
+| 1M | 8K | 305.7 | 21.59 | 307.2 | 20.96 | 912 |
+| 1M | 16K | 399.1 | 20.84 | 399.6 | 20.28 | 777 |
+
+All 24 combinations completed; actual loaded capacities and input/output counts were checked from the engine
+logs and returned tokens. The 256K/8K/512 cell is the mean of the paired model-comparison runs; every other
+cell has one measurement. Small differences are not statistically established gains.
+
+Larger capacities reserve more KV/index storage, leaving fewer VRAM expert slots. Prefill stayed broadly similar
+by configured capacity; do not read the faster 16K-prefill points as a context-size optimization. Native memory
+auto-budgeting remained enabled: device prestaging was reduced with headroom and was not allocated in the
+1M/16K case. No per-context flag tuning or packed-KV fallback was used.
+
+These are **4K to 16K actual prompts with larger configured capacities**, not full-capacity prefill or recall
+tests. They do not validate 1M-token prompt quality. Residency-biased routing remains enabled, so this speed
+grid also does not establish equal answer quality across capacities. CPU/CUDA were exercised; HIP/SYCL were not.
+
+### Local runtime checks (RTX 3090 24 GB, Ryzen 7 3700X, 125 GiB RAM)
+
+Measured on 2026-10-21 with the complete acrogenesis 1017 IQ2_XXS shards, the dashboard's single-card
+`~/models/ds41-server.json` profile, 60 GiB expert arena and 262144 configured context. The card at PCI
+`00000000:2B:00.0` was selected by UUID; the existing shared GPU lock, 110 GiB cgroup limit, no-swap limit,
+localhost bind and disabled MTP were retained.
+
+An unbiased cache check reused **30574 of 30594 input tokens**, reading the remaining **20 in 2.245 s**;
+reading the same full follow-up cold took **90.314 s**. Regenerating the original 30575-token prompt read no
+tokens (0.3 ms prompt time). These are controlled cache timings with GPU-only experts and single-token suffix
+passes, not end-to-end answer latency or a claim of bit-identical batched and sequential arithmetic.
+
+Batch-size tuning alone did not show a repeatable fresh-prefill gain. Two fresh 20976-token requests per arm,
+same source-text fixture, `--prompt-batch 12288` with the existing free-VRAM clamp:
+
+| Dense chunk / graph path | KV storage | Prefill tok/s, run 1 / run 2 |
+| --- | --- | ---: |
+| 512, composite operators | BF16 | 347.0 / 319.8 |
+| 512, fused fake-quant + HC mixes | BF16 | 344.3 / 318.7 |
+| 256, fused operators | packed FP4 | 328.1 / 353.6 |
+
+The ranges overlap; these measurements do not justify changing the default dense chunk from 512. On a separate
+30581-token fixture, chunk 256 + packed KV gave 352.0 / 364.4 tok/s and chunk 512 + packed KV gave 344.1 / 358.7.
+Chunk 1024 failed a 4553 MiB graph allocation and is not recommended for this 24 GB profile. The fused operators
+passed CPU and CUDA bit-parity gates; packed KV passed its CUDA bit-parity gate. Parity alone is not a throughput
+measurement.
+
+**The measured prefill improvement came from expert dispatch, not a larger batch.** A staged arena launch
+previously split only on routing-entry adjacency. An unrouted expert could leave a physical pointer gap inside
+that launch; the MMQ stride check then rejected the whole launch and ran MMVQ instead. The opt-in
+`STRATA_PRESTAGE_MMQ=1` also splits on physical pointer adjacency, using the existing streamed-expert convention.
+It leaves the source default unchanged and is enabled in this PC's dashboard base config.
+
+Paired 20976-token runs, same batches and `MIMO_CHUNK_PROF=1` in both arms:
+
+| Staged arena dispatch | Prefill tok/s, run 1 / run 2 |
+| --- | ---: |
+| Legacy pointer-gap fallback | 349.8 / 323.8 |
+| `STRATA_PRESTAGE_MMQ=1` | 436.6 / 398.8 |
+
+Mean throughput increased **24.0%**. In the first run, grouped-expert GPU kernel time fell from 25.776 s to
+4.119 s; more, smaller contiguous MMQ launches beat the large MMVQ fallbacks. MMQ and MMVQ use different
+activation arithmetic, so this opt-in is not claimed byte-identical to the legacy mixed-kernel path.
+
+**Routing quality versus decode speed:** four short greedy fixtures, seed 17, with the original `0.6` file penalty.
+The code fixture explicitly distinguishes touching real endpoints from adjacent integer endpoints and checks
+merging, empty input and non-mutation. The LRU fixture's correct miss count is 10.
+
+| Routing | Arithmetic tok/s | Code tok/s | LRU final miss count | Tool arguments |
+| --- | ---: | ---: | ---: | --- |
+| Existing `--route-bias 0.8`, no rank bound | 19.0 | 22.2 | 9 (incorrect) | valid |
+| Bias 1.0, native top-12, protect 0 | 8.2 | 8.6 | 10 | valid |
+| Bias 1.0, native top-24, protect 0 | 12.0 | 13.8 | 10 | valid |
+
+These are individual fixtures, not an accuracy benchmark. No repeated-12-word diagnostic triggered, so they do
+not establish that looping has been eliminated. Tight bounds improved this reasoning answer but substantially
+slowed decoding; the deployed profile therefore retains `0.8 / 0.6`, rather than silently taking that slowdown.
+Set `STRATA_RB_MAX_RANK=24` to try the bounded policy; optionally set `STRATA_RB_PROTECT=1` or `2` to preserve
+native leaders, which can increase I/O. Restart the engine after changing these environment settings.
+The comparison Qwen and Maya profiles on this PC did not enable analogous residency-affinity routing; they are
+not controls for the quality of Xolotl's full-strength bias.
+
+Cache correctness was checked separately from numerical kernel changes. With GPU-only expert computation,
+`--no-chunk-mmq`, fixed pass partitions and `STRATA_ARENA_REBAL=0`, all **129280** cached/cold last-token logits
+were byte-identical on the complete 40-layer model. Independent cold repeats were also byte-identical in that
+control. The legacy mixed-MMQ/MMVQ path differed even between independent cold repeats, so its differences cannot
+be attributed to cache restoration alone. The permanent CPU regression also covers shared KV/index sources,
+odd/even compressor boundaries, rewritten markers, regeneration, cancellation, stop tokens, image invalidation
+and parked-conversation Engram history.
+The same **129280-logit byte-identity** check also passed with `STRATA_PRESTAGE_MMQ=1` and arena rebalancing
+enabled, using aligned `512 + 512 + 1` pass partitions. This checks both prefix restoration and consistent MMQ
+dispatch; it does not promise identical rounding when the pass partitions themselves change.
+
+An unprofiled smoke run of the actual dashboard base config read a fresh **30575-token** prompt at
+**451.4 tok/s**. Its next rendered turn reused **30574 tokens**, read **38 new tokens in 4.511 s**, answered
+the arithmetic question correctly, and regenerated with **zero** prompt tokens read. A subsequent DSML call
+carried the requested function name and both exact argument values. The standalone service was stopped after
+verification, restoring its initially inactive state; start it from the console or `~/models/ds41-server.sh start`.
+
+
+Artifacts, including complete requests/responses, per-arm configs and engine logs:
+`~/models/benchmarks/dsv41-runtime-20261021/`. Regression commands:
+
+```bash
+cmake --build build-xolotl --target ds41_generate test_ds41_route test_ds41_geometry test_ds41_dense test_ds41_engram
+build-xolotl/test_ds41_route
+CUDA_VISIBLE_DEVICES=1 build-xolotl/test_ds41_route --cuda
+python3 tools/v41/serve/test_ds41_reuse.py --engine build-xolotl/ds41_generate
+build-xolotl/test_ds41_geometry --compat-self-test
+build-xolotl/test_ds41_dense --compat-self-test
+build-xolotl/test_ds41_engram
+```
+
+## Latest (2026-10-20)
+
+- **The acrogenesis 1017 IQ2_XXS release runs**: 10 shards (335 GiB), real headers pass geometry and the full
+  tensor map, Engram tables load from shards 8/9, CPU and GPU produce identical tokens. On a 1024-token real-text
+  prompt (128 generated, server mode, 60 GiB arena): **85.8 tok/s prefill, 25.7 tok/s decode** with a rank
+  profile; 77.9 tok/s prefill and 3.4 tok/s decode without one (index-order seeding leaves the hot experts on
+  NVMe). The GSQ release's `rank.bin` applies - same architecture. Quality on that fixture: PPL 48.3 / top-1 42.2%
+  (CPU 42.9 / 43.1%), against GSQ's 25.3 / 44.7% on the same data: the uniform IQ2_XXS quant is lossier than the
+  calibrated GSQ file, as expected.
+- **Fixed: the VRAM cache opened at init for uniform-blob models.** The deferred-cache flag the driver computed for
+  prompts was never handed to the tier, so a file with a single expert type opened its cache at load (13.37 GiB for
+  1017) and the prompt batch then failed with `c_stage: out of memory`. The driver passes the deferral now; uniform
+  models seed after the prompt exactly as the mixed-tier GSQ file always did. The GSQ path is untouched
+  (`mixed_sizes` skipped that block already).
+- Layer split on 1017, same flags: 16.9 tok/s decode / 23.7 prefill across two cards against 25.2 / 25.8 on the
+  x16 card - the same cross-device cost as the GSQ benchmark, so the second card stays free.
+
+## Latest (2026-10-19)
+
+- **Third-party GGUFs load.** The acrogenesis 1017 release (10 shards, 359 GB, every expert IQ2_XXS) reads and runs:
+  the real headers pass the geometry and tensor-map checks, the Engram tables come out of shards 8 and 9, expert
+  blobs are assembled from all ten. Two holes closed on the way: a uniform-tier file asked for 130.52 GiB of VRAM
+  cache on an 11.34 GiB card (it was sized by the model's expert count instead of the measured budget), and an
+  IQ2_XXS `ffn_down` had no grouped kernel (`native_grouped_parity`: 0 failures). See "Third-party GGUFs" below.
+- **Layer split across GPUs** (`--split K[,K2..]` with `--split-device`, the V4.1 engine's half of upstream's
+  `--layer-split`). A 4-layer synthetic V4.1 file run unsplit, split on one card and split across two dumps
+  bit-identical logits and tokens; the GSQ file splits and runs, its divergence from the unsplit arm no larger than
+  two runs that differ only in cache size. The default path is byte-identical to the previous build:
+  `tools/v41/vision/check_text_regression.py` reports every compared artifact identical, the serve arm included.
+  Refusals, per-stage VRAM accounting and the measurements: [MULTI_GPU.md](MULTI_GPU.md).
+- **Fixed: a crash on the real server path.** The stage struct snapshotted the routed-sum device pointer once, but a
+  batched prompt's `set_columns()` reallocates it; the next decode pass then wrote through the stale pointer (Xid 31
+  MMU fault, `tier.run_multi_to_dev`). The pointer is refreshed at both reallocation sites now, and the server
+  config (DSpark, `--kv-fp4`, arena-adapt, x0.5 bias) runs the GSQ file at 19.2 tok/s decode / 62 tok/s prefill on
+  a 1024-token real-text prompt. Benchmark artifacts: `~/models/benchmarks/dsv41-1gpu-vs-2gpu-2026-10-19/`.
+
 ## Latest (2026-10-15)
 
 - **Coding quality vs speed, measured on real tasks** (21 HumanEval + 10 tool calls, greedy; `~/AI/v41-dev/taskeval`):
@@ -101,6 +335,28 @@ Quality on held-out data against the FP8 original ("teacher"):
 
 Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380, top-1 0.822.
 
+### Third-party GGUFs: the acrogenesis 1017 shards (359 GB, uniform IQ2_XXS)
+
+The engine also reads a sharded release GGUF directly - **[acrogenesis/DeepSeek-V4.1-Flash-1017-IQ2_XXS-GGUF](https://huggingface.co/acrogenesis/DeepSeek-V4.1-Flash-1017-IQ2_XXS-GGUF)**,
+10 shards, every expert IQ2_XXS, dense tensors Q8_0, the Engram tables in shards 8 and 9. Checked on a 2 x RTX 3090
+PC (2026-10-19), with the first 4 GiB of each shard on disk (a prefix tree: weights past that read as zero, so the
+token values below say nothing about quality - what was under test was the load path):
+
+- `test_ds41_geometry` on the real headers prints `ok geometry`, `ok V4.1 shape`, `ok full tensor map`. The file
+  carries none of the keys the engine's own file has, and each gap takes its fallback: no `vocab_size` (the
+  tokenizer's 129 280), no per-layer source lists (kv sources read off the tensors - 2, 8, 14, 20; index 2, 8, 14,
+  20, 24, 28, 32, 36), no candidate-block keys (the release's defaults - layer 20, 2048 x 8), no Engram row counts
+  (derived - 384 006 168 rows, 99 092 compressed ids), no `swiglu_clamp_exp` key read as the engine expects (the
+  file's per-layer clamp: 10.0).
+- The load walks the shards: 154 dense matrices converted to the compute type, the two Engram tables (384 006 168
+  and 384 016 682 Q8_0 rows) read straight out of shards 8 and 9, expert blobs assembled from all ten with preads
+  - no mmap of the file. CPU and CUDA both run a prompt and a decode over it (`--experts cpu` and `--experts gpu`,
+  IQ2_XXS blobs through the grouped expert kernels).
+- A uniform-tier file is the case that used to fail at `tier init`: with every expert the same size, the VRAM cache
+  was sized by the model's expert count - 15 360 slots x 8.7 MB = 130.52 GiB on a card with 11.34 GiB free -
+  because only the mixed-tier path consulted the measured GiB budget. It is sized by that budget now, the same
+  rule the GSQ file's mixed tiers already followed.
+
 ### Results (RTX 4090 24 GB · Ryzen 7 5700X · 90 GB DDR4 · NVMe, 2026-10-12)
 
 | | First working GPU run (2026-10-11 morning) | Now |
@@ -111,8 +367,8 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
 | Decode in a real agent session (20-32K context, server) | - | 22.7-28.2 tok/s |
 | Model load | 211 s | ~50 s |
 
-- **The prompt is exact.** Every prefill speed-up keeps the last-token logits byte-identical (8192-token check md5
-  `ee31507a0e88`), also through the server and its conversation reuse. The prompt's routed experts run on int8
+- **The prompt routes exactly.** The 2026-10-12 GSQ run's 8192-token last-row check was md5
+  `ee31507a0e88`, including through the server and its conversation reuse. The prompt's routed experts run on int8
   tensor cores (MMQ; the ternary experts through a lossless PTQ1_0 -> Q2_0 transcode on the card): +12% over the
   dp4a kernels (`--no-chunk-mmq`, md5 `4d229102872a`) at equal quality (4096-token code ppl 2.3790 vs 2.3799).
 - **Decode routes with two selection-only biases** (`--route-bias 1.0`, `--route-bias-file 0.6`, both defaults):
@@ -123,6 +379,39 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
 - Where the time goes - prefill (8192 tokens, ~37 s): dense half ~11 s, experts ~26 s (the grouped expert kernels and
   ~10 GB/s of expert uploads). Decode (~38 ms/token): dense half ~19 ms (its Q8_0 weights read at ~880 GB/s - the
   card's bandwidth), expert tier ~16 ms.
+
+### Prefill: where the time goes (2026-10-19, GSQ, RTX 3090 on PCIe 4.0 x16)
+
+Real-text fixture, `--prefill-chunk 512`, `rank.bin`, one-shot (engine-reported split of the prompt time):
+
+| prompt tokens | arena GiB | total | dense | experts | of which NVMe wait | tok/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 60 | 16.15 s | 1.3 s | 14.8 s | 7.6 s | 63.4 |
+| 1024 | 88 | 14.60 s | 1.4 s | 13.2 s | 4.3 s | 70.1 |
+| 4096 | 60 | 30.22 s | 6.1 s | 23.9 s | 9.6 s | 135.6 |
+| 4096 | 88 | 32.56 s | 6.9 s | 25.4 s | 6.7 s | 125.8 |
+
+- **A 1024-token chunk routes to about 334 of the 384 experts in every layer**, so it has to move ~134 GB of
+  expert weights (334 x 40 layers x ~10 MB) to the card. The measured pinned H2D ceiling on this card is
+  **25.5 GB/s** (standalone probe, 10 MiB and 256 MiB copies); 134 GB is 5.3 s at that ceiling and the engine's
+  share is ~7 s (18.6 GB/s), so the copy is already near the link's limit.
+- **The rest is NVMe, and it does not overlap.** With 44% of the experts in a 60 GiB arena, ~5,200 expert reads
+  (~52 GB) take 7.6 s at the disk's ~7 GB/s, and they are exposed: the chunk path reads file-tier experts
+  synchronously (`blobs->read_part`) while the H2D and compute run. `STRATA_PRESTAGE_GIB=8` and
+  `STRATA_DMA_OVERLAP=1` change nothing here (measured: file wait still 7.6 s).
+- **Prompt length amortises the transfer.** The per-layer expert union saturates at 384, so a 4096-token chunk
+  moves the same bytes over 4x the tokens (135.6 tok/s); the 8192-token figure in "Results" (~250 tok/s) is the
+  same curve. Short prompts are transfer-bound, long prompts become compute-bound.
+- **Levers, in expected order:** (1) prefetch the next layer's file-tier union into the stash while the current
+  layer runs - the decode path already has `spec_read` for exactly this; up to 4-7 s at 1024 tokens;
+  (2) a larger arena (88 GiB measured +11% at 1024; the default 60 is conservative and this host has the RAM);
+  (3) seed VRAM slots before a short prompt (about 9% fewer bytes at 1024); (4) two-card expert parallelism -
+  aggregate x16 + x4 links, ~1.2x, and it needs the batched prompt path on stages; (5) H2D scheduling
+  (18.6 -> 25 GB/s would save ~1.8 s at 1024).
+- **Ceiling at 1024 tokens** with every lever is roughly 133 tok/s (dense 1.3 s + H2D 5.4 s + overlapped NVMe);
+  triple digits at 1K tokens is an edge case, while 4K already reaches them and 8K matches the Results table.
+  Models with far smaller expert pools (Qwen Flash, GLM Flash) prefills in the hundreds because their experts are
+  resident and prefill is compute-bound, not because this engine's kernels are slower.
 
 How each number was reached, step by step: [docs/ds4/V41_PROGRESS.md](ds4/V41_PROGRESS.md).
 
@@ -137,6 +426,9 @@ python3 tools/v41/extract_engram.py /path/to/DeepSeek-V4.1-Flash-FP8 --to layers
 # defaults are the tuned config (layer-major prompt, prefetch, enc-skip, prestage, route bias 1.0 + file penalty 0.6)
 STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 -- build-ds4-gpu/ds41_generate -m V41-GSQ.gguf \
      --ids-file prompt.i32 -n 128 --backend cuda --experts gpu --engram "/fast/a:/fast/b" --rank rank.bin
+# two cards: --split 20 runs layers 20-39 and the output head on CUDA1 (K is the FIRST layer of each later card;
+# --split-device names the cards, default 1,2,3,..; --split 2,8,14 = four cards). Refusals and measurements:
+# docs/MULTI_GPU.md. A split needs --backend cuda --experts gpu and --prompt-batch 1.
 ```
 
 `STRATA_NO_LARGEPAGES=1` pins the 60 GiB arena at 1.2 GB/s (load ~50 s) instead of ~0.16 GB/s. Optional +5% decode:
@@ -170,9 +462,12 @@ Every prompt token routes exactly by default. Exact passes and the batch agree t
 distribution (batch-shape float noise). An opt-in **fast quick path** runs turns of up to 768 tokens with the decode
 biases at 40-57 tok/s (300 tokens in 6.4 s), but measurably shifts the output (KL 0.10-0.15):
 `STRATA_SERVE_STEP_MAX=768 STRATA_SERVE_PASS_BIAS=1`. A conversation that extends the last request continues from it;
-one whose re-rendered history differs (DeepSeek's encoder drops earlier turns' thinking) restores the snapshot taken at
-the end of the last prompt. The server writes every request's thinking, answer and tool calls to
-`/tmp/strata-ds41-text.log` (`STRATA_TEXT_LOG`) and keeps the last 100 requests at `/api-monitor`.
+one whose generation marker is rewritten by DeepSeek's reasoning-dropping encoder restores the checkpoint just
+before that marker. Identical prompts restore the full-prompt snapshot and saved logits. A prefix edited before
+either captured position must be read again; rolling rings cannot safely rewind to an arbitrary common prefix.
+`STRATA_SERVE_PARK=0` disables preservation across unrelated requests, not ordinary continuation reuse.
+The server writes every request's thinking, answer and tool calls to `/tmp/strata-ds41-text.log`
+(`STRATA_TEXT_LOG`; set to `0` to disable) and keeps the last 100 requests at `/api-monitor`.
 
 ---
 

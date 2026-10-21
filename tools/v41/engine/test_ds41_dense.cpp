@@ -4,12 +4,14 @@
 // with the routed experts computed by a plain reference (rows dequantized, F32 matvec) and writes per-layer block
 // outputs, router ids / weights and the logits as raw files for compare_ds41.py (vs ds41_golden.py's golden.npz):
 //   DIR/<mode>/x<L>.f32 [S, HC, D], pre<L>.f32 [S, HC], ids<L>.i32 [S, 6], wts<L>.f32 [S, 6], logits.f32 [S, V]
+// --compat-self-test: model-free CPU regressions for mmap embedding row formats and folded Engram gates.
 #include "ds41_dense.hpp"
 
 #include "strata/kernels/cpu/ptq1_0.hpp"
 
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -24,7 +26,123 @@
 using namespace strata;
 using namespace strata::v41;
 
+
+// Implementation-private helpers; the same convention as test_ds41_route, without expanding the public API.
+namespace strata::v41 {
+ggml_tensor * ds41_engram_gate_weights(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
+bool ds41_embedding_layout(uint32_t, int64_t, size_t &, ggml_to_float_t &);
+bool ds41_gather_embedding_rows(const uint8_t *, size_t, ggml_to_float_t, int64_t, int64_t, const int *, int, float *);
+}
 namespace {
+
+int compatibility_self_test() {
+    int fails = 0;
+    auto check = [&](const char * name, bool ok) {
+        std::printf("%s %s\n", ok ? "ok  " : "FAIL", name);
+        fails += !ok;
+    };
+    constexpr int D = 64, V = 4;
+    const int ids[] = {3, 1, 0, 3};
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        size_t stride = 0;
+        ggml_to_float_t decode = nullptr;
+        const bool layout = ds41_embedding_layout(type, D, stride, decode);
+        check("supported embedding layout", layout);
+        if (!layout) continue;
+        const size_t expected_stride = type == GGML_TYPE_Q8_0 ? D / 32 * 34 : D * (type == GGML_TYPE_F32 ? 4 : 2);
+        // Leave enough trailing bytes that the old uint16[D] stride gives wrong values, not an accidental OOB.
+        std::vector<uint8_t> table(V * D * 4, 0);
+        std::vector<float> expected(V * D), got(4 * D);
+        for (int r = 0; r < V; ++r) {
+            for (int i = 0; i < D; ++i) {
+                const int q = (i * 7 + r * 11) % 61 - 30;
+                const float scale = 0.5f * (1 + r + i / 32);
+                expected[r * D + i] = scale * q;   // exactly representable in all three float formats
+            }
+            uint8_t * row = table.data() + r * expected_stride;
+            if (type == GGML_TYPE_Q8_0) {
+                for (int b = 0; b < D / 32; ++b) {
+                    const ggml_fp16_t scale = ggml_fp32_to_fp16(0.5f * (1 + r + b));
+                    std::memcpy(row + b * 34, &scale, 2);
+                    for (int j = 0; j < 32; ++j) {
+                        const int8_t q = (int8_t) (((b * 32 + j) * 7 + r * 11) % 61 - 30);
+                        std::memcpy(row + b * 34 + 2 + j, &q, 1);
+                    }
+                }
+            } else if (type == GGML_TYPE_F16) {
+                ggml_fp32_to_fp16_row(expected.data() + r * D, reinterpret_cast<ggml_fp16_t *>(row), D);
+            } else if (type == GGML_TYPE_BF16) {
+                ggml_fp32_to_bf16_row_ref(expected.data() + r * D, reinterpret_cast<ggml_bf16_t *>(row), D);
+            } else {
+                std::memcpy(row, expected.data() + r * D, D * sizeof(float));
+            }
+        }
+        bool ok = ds41_gather_embedding_rows(table.data(), stride, decode, D, V, ids, 4, got.data());
+        for (int t = 0; t < 4; ++t)
+            for (int i = 0; i < D; ++i) ok &= got[t * D + i] == expected[ids[t] * D + i];
+        check(type == GGML_TYPE_Q8_0 ? "Q8_0 nonzero/duplicate row values" :
+              type == GGML_TYPE_F16 ? "F16 row values" :
+              type == GGML_TYPE_BF16 ? "BF16 row values" : "F32 row values", ok);
+        for (int invalid : {-1, V})
+            check("embedding id range rejected", !ds41_gather_embedding_rows(table.data(), stride, decode, D, V,
+                                                                           &invalid, 1, got.data()));
+    }
+    size_t stride = 0;
+    ggml_to_float_t decode = nullptr;
+    check("partial quant block rejected", !ds41_embedding_layout(GGML_TYPE_Q8_0, D - 1, stride, decode));
+    check("unknown embedding type rejected", !ds41_embedding_layout(GGML_TYPE_COUNT, D, stride, decode));
+    check("non-row-decodable embedding type rejected", !ds41_embedding_layout(GGML_TYPE_Q8_1, D, stride, decode));
+
+    ggml_init_params ip = {2 * 1024 * 1024, nullptr, false};
+    ggml_context * gc = ggml_init(ip);
+    check("Engram graph context", gc != nullptr);
+    if (!gc) return 1;
+    constexpr int GD = 8, HC = 2;
+    ggml_tensor * q = ggml_new_tensor_2d(gc, GGML_TYPE_F32, GD, HC);
+    ggml_tensor * k = ggml_new_tensor_2d(gc, GGML_TYPE_F32, GD, HC);
+    ggml_tensor * folded = ggml_new_tensor_2d(gc, GGML_TYPE_F32, GD, HC);
+    ggml_tensor * h = ggml_new_tensor_2d(gc, GGML_TYPE_F32, GD, HC);
+    ggml_tensor * key = ggml_new_tensor_2d(gc, GGML_TYPE_F32, GD, HC);
+    float oracle[HC] = {};
+    for (int i = 0; i < GD * HC; ++i) {
+        const float qv = 0.25f * (i % 5 - 2), kv = 0.5f * (i % 3 + 1);
+        const float hv = 0.125f * (i - 5), keyv = 0.25f * (3 - i % 7);
+        static_cast<float *>(q->data)[i] = qv;
+        static_cast<float *>(k->data)[i] = kv;
+        static_cast<float *>(folded->data)[i] = qv * kv;
+        static_cast<float *>(h->data)[i] = hv;
+        static_cast<float *>(key->data)[i] = keyv;
+        oracle[i / GD] += hv * qv * kv * keyv;
+    }
+    auto gate = [&](ggml_tensor * weights) {
+        ggml_tensor * dot = ggml_scale(gc, ggml_sum_rows(gc, ggml_mul(gc, ggml_mul(gc, h, weights), key)),
+                                      1.0f / std::sqrt((float) GD));
+        ggml_tensor * mag = ggml_sqrt(gc, ggml_clamp(gc, ggml_abs(gc, dot), 1e-6f, INFINITY));
+        return ggml_sigmoid(gc, ggml_mul(gc, ggml_sgn(gc, dot), mag));
+    };
+    ggml_tensor * separate = gate(ds41_engram_gate_weights(gc, nullptr, q, k));
+    ggml_tensor * product = gate(ds41_engram_gate_weights(gc, folded, nullptr, nullptr));
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 128, false);
+    ggml_build_forward_expand(gf, separate);
+    ggml_build_forward_expand(gf, product);
+    const bool computed = ggml_graph_compute_with_ctx(gc, gf, 1) == GGML_STATUS_SUCCESS;
+    check("Engram gate graph compute", computed);
+    if (computed) {
+        bool equivalent = true, correct = true;
+        for (int c = 0; c < HC; ++c) {
+            const float dot = oracle[c] / std::sqrt((float) GD);
+            const float signed_root = dot == 0 ? 0 : std::copysign(std::sqrt(std::max(std::fabs(dot), 1e-6f)), dot);
+            const float expected = 1.0f / (1.0f + std::exp(-signed_root));
+            const float a = static_cast<float *>(separate->data)[c], b = static_cast<float *>(product->data)[c];
+            equivalent &= std::fabs(a - b) <= 1e-6f;
+            correct &= std::fabs(b - expected) <= 1e-6f;
+        }
+        check("folded and separate Engram gates equivalent", equivalent);
+        check("folded Engram gate uses exact stored product", correct);
+    }
+    ggml_free(gc);
+    return fails ? 1 : 0;
+}
 
 void save(const std::string & p, const void * d, size_t bytes) {
     std::ofstream f(p, std::ios::binary);
@@ -98,6 +216,7 @@ std::vector<int> parse_ints(const std::string & s) {
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--compat-self-test") return compatibility_self_test();
     if (argc < 2) { std::fprintf(stderr, "usage: see the file header\n"); return 2; }
     std::string path = argv[1], out = "/tmp/ds41", mode = "both";
     std::vector<int> toks;

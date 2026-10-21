@@ -1,3 +1,25 @@
+## Fork updates: DeepSeek-V4.1 EXL3 support
+
+This fork adds **SAGE EXL3 routed experts** with mixed bitrates per expert and projection, using
+`--exl3-dir` alongside a GGUF dense/Engram support pack. Text and vision work with a configured 512K context.
+
+**`STRATA_EXL3_FAST=1`** enables compact RAM-arena packing, overlapping expert reads and PCIe copies,
+GPU-side activation gathering, and decode prefetch consumption. The existing GEMV arithmetic is preserved;
+the complete 256-token exact-routing regression logit dump is byte-identical to the original path.
+
+Measured on **one RTX 3090 (24 GB, PCIe 4.0 x16), 125 GiB system RAM**, with a 60 GiB arena:
+
+| Workload | Before | Optimized |
+| --- | ---: | ---: |
+| 1K-token prefill | 26.4 tok/s | **126.6 tok/s (4.8x)** |
+| Decode after 1K prompt | 11.0 tok/s | **22.5 tok/s (2.0x)** |
+| 20,976-token prefill | 149.3 tok/s | **413.7 tok/s (2.8x)** |
+
+The 1K results average two fresh prompts with 128 generated tokens each; the long-prompt result is one run.
+See [EXL3 implementation, measurements and reproduction](docs/EXL3_PERFORMANCE.md).
+
+---
+
 <p align="center"><img src="docs/brand/assets/readme-header-1200.png" alt="Xolotl - frontier MoE models on one gaming PC" width="100%"></p>
 
 <h1 align="center">Xolotl</h1>

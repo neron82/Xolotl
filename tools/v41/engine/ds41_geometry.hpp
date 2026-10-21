@@ -8,6 +8,17 @@
 // indexer key on kv sources, Engram on its layers, routed experts either one stacked tensor per role or one per type
 // + the I32 type maps.
 //
+// A file written by llama.cpp's converter - acrogenesis' DeepSeek-V4.1-Flash-1017 IQ2_XXS build, and the releases
+// the recipe kit points at - is the same model in llama.cpp's spellings: `deepseek41.embedding_length` for
+// `hidden_size`, `attention.head_count` for `num_attention_heads`, and so on (detail::canon).  Its Engram shape is
+// in flat engram.head_count / key_length keys instead of the config JSON. Maya uses layers / head_dim /
+// num_embeddings aliases and a pad_token_id in the original vocabulary (mapped through token_map here).
+// Missing source-layer lists, candidate blocks, table rows and compressed vocabulary are derived from the
+// tensors, release geometry, primes and token map. Native/canonical keys always take precedence over aliases.
+// Types are not a spelling: a dense matrix stored as BF16 where the engine computes in F16 is converted at load
+// (ds41_dense.cpp); mmap token embeddings are decoded one requested row at a time, and GGUF Engram tables may
+// be Q8_0 or Q6_K (ds41_engram.cpp). Maya's F32 Engram gate stores the exact folded Q/K norm product.
+//
 // Header-only; reads the header region only (GgufModel mmaps it), no tensor data except the two I32 type maps.
 #pragma once
 
@@ -26,7 +37,7 @@
 namespace strata::v41 {
 
 namespace ty {
-constexpr uint32_t F32 = 0, F16 = 1, Q8_0 = 8, Q3_K = 11, I8 = 24, I32 = 26, Q2_0 = 42, PTQ1_0 = 143;
+constexpr uint32_t F32 = 0, F16 = 1, Q8_0 = 8, Q3_K = 11, Q6_K = 14, I8 = 24, I32 = 26, Q2_0 = 42, PTQ1_0 = 143;
 }
 
 /// One layer's routed experts: the type of each expert's gate+up and of its down, and where each expert's rows are
@@ -59,6 +70,11 @@ struct Ds41Geometry {
     std::vector<int64_t> engram_mult;                ///< [n_engram_layers * ngram]
     int64_t bos = -1, eos = -1;
     std::vector<Ds41ExpertMap> experts;              ///< [n_layer]
+    // A file in llama.cpp's spelling (the note at the top): what the file calls each tensor and what type it
+    // stores it as, which the loader needs because they are not the engine's.  Empty for a file v41_gguf.py wrote.
+    std::map<std::string, std::string> rename;         ///< file tensor name -> the engine's name for it
+    std::map<std::string, uint32_t> want;              ///< engine tensor name -> the type the engine reads it as
+    std::vector<std::string> engram_tables;            ///< the file's Engram table tensors, in engram_layers order
 
     bool is_kv_source(int64_t l) const { return contains(kv_sources, l); }
     bool is_index_source(int64_t l) const { return contains(index_sources, l); }
@@ -178,27 +194,102 @@ inline std::string ds41_read_int_array(const std::string & path, const std::stri
 
 // ------------------------------------------------------------------ key readers (missing key == error)
 namespace detail {
+// The same model in two spellings.  v41_gguf.py writes the name HuggingFace's config.json uses; llama.cpp's
+// converter writes the name llama.cpp's own gguf keys use.  The left column is what this engine asks for.
+inline const char * canon(const std::string & hf) {
+    static const struct { const char * hf, * llama; } tab[] = {
+        { "hidden_size", "embedding_length" },
+        { "num_hidden_layers", "block_count" },
+        { "num_attention_heads", "attention.head_count" },
+        { "num_key_value_heads", "attention.head_count_kv" },
+        { "head_dim", "attention.key_length" },
+        { "qk_rope_head_dim", "rope.dimension_count" },
+        { "q_lora_rank", "attention.q_lora_rank" },
+        { "o_lora_rank", "attention.output_lora_rank" },
+        { "o_groups", "attention.output_group_count" },
+        { "sliding_window", "attention.sliding_window" },
+        { "n_routed_experts", "expert_count" },
+        { "num_experts_per_tok", "expert_used_count" },
+        { "moe_intermediate_size", "expert_feed_forward_length" },
+        { "n_shared_experts", "expert_shared_count" },
+        { "hc_mult", "hyper_connection.count" },
+        { "hc_sinkhorn_iters", "hyper_connection.sinkhorn_iterations" },
+        { "hc_eps", "hyper_connection.epsilon" },
+        { "index_n_heads", "attention.indexer.head_count" },
+        { "index_head_dim", "attention.indexer.key_length" },
+        { "index_topk", "attention.indexer.top_k" },
+        { "compress_ratios", "attention.compress_ratios" },
+        { "rms_norm_eps", "attention.layer_norm_rms_epsilon" },
+        { "rope_theta", "rope.freq_base" },
+        { "compress_rope_theta", "attention.compress_rope_freq_base" },
+        { "rope_scaling.factor", "rope.scaling.factor" },
+        { "rope_scaling.beta_fast", "rope.scaling.yarn_beta_fast" },
+        { "rope_scaling.beta_slow", "rope.scaling.yarn_beta_slow" },
+        { "rope_scaling.original_max_position_embeddings", "rope.scaling.original_context_length" },
+        { "max_position_embeddings", "context_length" },
+        { "routed_scaling_factor", "expert_weights_scale" },
+        { "norm_topk_prob", "expert_weights_norm" },
+        { "engram.layer_ids", "engram.layers" },
+        { "engram.key_length", "engram.head_dim" },
+        { "engram.rows", "engram.num_embeddings" },
+    };
+    for (const auto & a : tab) if (hf == a.hf) return a.llama;
+    return nullptr;
+}
+/// `deepseek41.<hf>` under llama.cpp's spelling of it ("" when the key has no other spelling).
+inline std::string canon_key(const std::string & k) {
+    static const std::string P = "deepseek41.";
+    if (k.compare(0, P.size(), P) != 0) return {};
+    const char * c = canon(k.substr(P.size()));
+    return c ? P + c : std::string();
+}
+/// A key, or the same key in the other spelling.  The engine's own spelling is always tried first.
+inline const MetaValue * get2(const GgufFile & g, const std::string & k) {
+    if (const MetaValue * v = g.get(k)) return v;
+    const std::string a = canon_key(k);
+    return a.empty() ? nullptr : g.get(a);
+}
 inline std::string u64(const GgufFile & g, const std::string & k, int64_t & out) {
-    const MetaValue * v = g.get(k);
+    const MetaValue * v = get2(g, k);
     if (!v) return "missing " + k;
     if (!v->is_num()) return k + " is not a number";
     out = (int64_t) v->num();
     return {};
 }
 inline std::string f64(const GgufFile & g, const std::string & k, double & out) {
-    const MetaValue * v = g.get(k);
+    const MetaValue * v = get2(g, k);
     if (!v) return "missing " + k;
     if (!v->is_num()) return k + " is not a number";
     out = v->num();
     return {};
 }
 inline std::string arr(const GgufFile & g, const std::string & k, std::vector<int64_t> & out) {
-    const MetaValue * v = g.get(k);
+    const MetaValue * v = get2(g, k);
     if (!v) return "missing " + k;
     if (v->type != MetaType::ARRAY) return k + " is not an array";
     if (v->count > v->items.size()) return k + ": longer than the reader's sample (use ds41_read_int_array)";
     out.clear();
     for (const auto & e : v->items) out.push_back((int64_t) e.num());
+    return {};
+}
+/// "2, 8, 14" - for the lines that name what the file did not say.
+inline std::string join(const std::vector<int64_t> & v) {
+    std::string s;
+    for (size_t i = 0; i < v.size(); ++i) { if (i) s += ", "; s += std::to_string(v[i]); }
+    return s;
+}
+/// The name llama.cpp's converter gives a tensor the engine names after model.py ("" when it has no other name).
+/// The three Engram tensors are the only ones: the converter copies the checkpoint's attribute names.
+inline std::string tensor_name(const std::string & n) {
+    static const struct { const char * ours, * llama; } tab[] = {
+        { "engram_q_norm.weight", "engram_q.weight" },
+        { "engram_k_norm.weight", "engram_k.weight" },
+        { "engram_kv.weight", "engram_wkv.weight" },
+    };
+    for (const auto & a : tab) {
+        const size_t L = std::strlen(a.ours);
+        if (n.size() > L && n.compare(n.size() - L, L, a.ours) == 0) return n.substr(0, n.size() - L) + a.llama;
+    }
     return {};
 }
 /// `"key":<number>` out of the deepseek41.config JSON (flat search; the keys are unique in DeepSeek's config)
@@ -225,28 +316,62 @@ inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G)
              { "n_routed_experts", &G.n_expert }, { "num_experts_per_tok", &G.n_used },
              { "moe_intermediate_size", &G.n_ff }, { "n_shared_experts", &G.n_shared }, { "hc_mult", &G.hc },
              { "hc_sinkhorn_iters", &G.hc_iters }, { "index_n_heads", &G.idx_heads }, { "index_head_dim", &G.idx_dim },
-             { "index_topk", &G.idx_topk }, { "candidate_source_layer_id", &G.cand_layer },
-             { "candidate_topk_blocks", &G.cand_blocks }, { "candidate_block_size", &G.cand_bsize },
-             { "vocab_size", &G.vocab }, { "max_position_embeddings", &G.ctx_len } })
+             { "index_topk", &G.idx_topk }, { "max_position_embeddings", &G.ctx_len } })
         if (!(e = detail::u64(g, P + u.k, *u.v)).empty()) return e;
+    if (detail::get2(g, P + "vocab_size")) {   // the engine's own file states the vocabulary; llama.cpp's does not
+        if (!(e = detail::u64(g, P + "vocab_size", G.vocab)).empty()) return e;
+    } else {
+        const MetaValue * tk = g.get("tokenizer.ggml.tokens");
+        if (!tk || tk->type != MetaType::ARRAY || tk->count < 1) return "no deepseek41.vocab_size, no usable tokenizer";
+        G.vocab = (int64_t) tk->count;
+        std::fprintf(stderr, "v41 geometry: no vocab_size key - using the tokenizer's %lld tokens\n", (long long) G.vocab);
+    }
     struct F { const char * k; double * v; };
     for (const F & f : std::initializer_list<F>{
              { "routed_scaling_factor", &G.weights_scale }, { "hc_eps", &G.hc_eps }, { "rms_norm_eps", &G.rms_eps },
              { "rope_theta", &G.rope_base }, { "compress_rope_theta", &G.compress_rope_base },
              { "rope_scaling.factor", &G.rope_factor }, { "rope_scaling.beta_fast", &G.beta_fast },
-             { "rope_scaling.beta_slow", &G.beta_slow }, { "rope_scaling.original_max_position_embeddings", &G.orig_ctx },
-             { "swiglu_limit", &G.swiglu_limit } })
+             { "rope_scaling.beta_slow", &G.beta_slow }, { "rope_scaling.original_max_position_embeddings", &G.orig_ctx } })
         if (!(e = detail::f64(g, P + f.k, *f.v)).empty()) return e;
+    if (detail::get2(g, P + "swiglu_limit")) {   // the engine's own file states one shared clamp
+        if (!(e = detail::f64(g, P + "swiglu_limit", G.swiglu_limit)).empty()) return e;
+    } else {   // llama.cpp writes the clamp per layer, never one shared limit
+        const MetaValue * cl = g.get(P + "swiglu_clamp_exp");
+        if (!cl || cl->type != MetaType::ARRAY || cl->count < 1 || cl->count > cl->items.size())
+            return "no deepseek41.swiglu_limit, no readable swiglu_clamp_exp";
+        for (const auto & x : cl->items) if (x.num() != cl->items[0].num()) return "swiglu_clamp_exp is not one value";
+        G.swiglu_limit = cl->items[0].num();
+        std::fprintf(stderr, "v41 geometry: swiglu_limit from the file's per-layer clamp: %.1f\n", G.swiglu_limit);
+    }
     {
-        const MetaValue * v = g.get(P + "norm_topk_prob");
+        const MetaValue * v = detail::get2(g, P + "norm_topk_prob");
         if (!v) return "missing deepseek41.norm_topk_prob";
         G.norm_topk = v->u != 0;
         const MetaValue * sf = g.get(P + "scoring_func");
-        if (!sf || sf->s != "sqrtsoftplus") return "scoring_func is not sqrtsoftplus";
+        if (sf && sf->s != "sqrtsoftplus") return "scoring_func is not sqrtsoftplus";
+        if (!sf) {
+            // llama.cpp spells the activation as its own enum; 4 is SQRT_SOFTPLUS, the one this engine runs.
+            int64_t gf = 0;
+            if (!(e = detail::u64(g, P + "expert_gating_func", gf)).empty()) return e;
+            if (gf != 4) return "expert_gating_func " + std::to_string(gf) + " is not sqrtsoftplus (4)";
+        }
     }
     if (!(e = detail::arr(g, P + "compress_ratios", G.ratio)).empty()) return e;
-    if (!(e = detail::arr(g, P + "kv_source_layer_ids", G.kv_sources)).empty()) return e;
-    if (!(e = detail::arr(g, P + "index_source_layer_ids", G.index_sources)).empty()) return e;
+    if ((int64_t) G.ratio.size() > G.n_layer) G.ratio.resize((size_t) G.n_layer);   // llama.cpp lists the MTP blocks too
+    const bool have_kv = detail::arr(g, P + "kv_source_layer_ids", G.kv_sources).empty();
+    const bool have_ix = detail::arr(g, P + "index_source_layer_ids", G.index_sources).empty();
+    if (have_kv != have_ix) return "the file gives only one of the two source-layer lists";
+    if (!have_kv) {
+        // A llama.cpp-converted file writes no source-layer keys at all: a layer is a kv source when it carries
+        // the compressor's kv tensor, and an index source when it carries the indexer's proj tensor.
+        for (int64_t l = 0; l < G.n_layer; ++l) {
+            const std::string s = "blk." + std::to_string(l) + ".";
+            if (model.find(s + "attn_compressor_kv.weight")) G.kv_sources.push_back(l);
+            if (model.find(s + "indexer.proj.weight")) G.index_sources.push_back(l);
+        }
+        std::fprintf(stderr, "v41 geometry: source layers read off the tensors - kv [%s], index [%s]\n",
+                     detail::join(G.kv_sources).c_str(), detail::join(G.index_sources).c_str());
+    }
     if ((int64_t) G.ratio.size() != G.n_layer) return "compress_ratios has " + std::to_string(G.ratio.size()) + " entries";
     for (int64_t r : G.ratio) if (r != 0 && r != 1 && r != 2) return "compress ratio " + std::to_string(r) + " (V4.1 has 0/1/2)";
     for (int64_t l : G.kv_sources) if (l < 0 || l >= G.n_layer || G.ratio[(size_t) l] == 0) return "bad kv source";
@@ -254,21 +379,39 @@ inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G)
     for (int64_t l = 0; l < G.n_layer; ++l)
         if (G.ratio[(size_t) l] && (G.kv_src(l) < 0 || G.idx_src(l) < 0 || G.ratio[(size_t) G.kv_src(l)] != G.ratio[(size_t) l]))
             return "layer " + std::to_string(l) + " has no kv/index source of its ratio";
+    if (detail::get2(g, P + "candidate_source_layer_id")) {   // the engine's own file states the candidate block
+        if (!(e = detail::u64(g, P + "candidate_source_layer_id", G.cand_layer)).empty()) return e;
+        if (!(e = detail::u64(g, P + "candidate_topk_blocks", G.cand_blocks)).empty()) return e;
+        if (!(e = detail::u64(g, P + "candidate_block_size", G.cand_bsize)).empty()) return e;
+    } else {
+        // The candidate block is the ratio-1 block the router prefetch fills.  V4.1 puts it on the first layer
+        // whose compress ratio is 1; the count and size are the release's own (its config.json: 2048 of 8).
+        G.cand_layer = -1;
+        for (int64_t l = 0; l < G.n_layer; ++l) if (G.ratio[(size_t) l] == 1) { G.cand_layer = l; break; }
+        if (G.cand_layer < 0) return "no candidate_source_layer_id and no ratio-1 layer to read it off";
+        G.cand_blocks = 2048; G.cand_bsize = 8;
+        std::fprintf(stderr, "v41 geometry: candidate block from the release's defaults - layer %lld, %lld of %lld\n",
+                     (long long) G.cand_layer, (long long) G.cand_blocks, (long long) G.cand_bsize);
+    }
     if (G.n_shared != 1 || G.hc < 1 || G.d_head <= G.d_rope || (G.n_head * G.d_head) % G.o_groups) return "unsupported shape";
-    // Engram: arrays (full, not the reader's sample) + the shape from the config JSON
-    const MetaValue * cfg = g.get(P + "config");
-    if (!cfg) return "missing deepseek41.config";
+    // Engram: arrays (full, not the reader's sample) + the shape.  v41_gguf.py puts the shape in the config JSON;
+    // llama.cpp writes it as flat engram.* keys and writes no config key at all.
     double d = 0;
-    if (!(e = detail::json_num(cfg->s, "engram_n_heads", d)).empty()) return e;
-    G.engram_heads = (int64_t) d;
-    if (!(e = detail::json_num(cfg->s, "engram_head_dim", d)).empty()) return e;
-    G.engram_dim = (int64_t) d;
-    if (!(e = detail::json_num(cfg->s, "engram_max_ngram_size", d)).empty()) return e;
-    G.engram_ngram = (int64_t) d;
-    if (!(e = detail::u64(g, P + "engram.pad_id", G.engram_pad)).empty()) return e;
-    if (!(e = detail::u64(g, P + "engram.compressed_vocab_size", G.engram_cvocab)).empty()) return e;
+    if (const MetaValue * cfg = g.get(P + "config")) {
+        if (!(e = detail::json_num(cfg->s, "engram_n_heads", d)).empty()) return e;
+        G.engram_heads = (int64_t) d;
+        if (!(e = detail::json_num(cfg->s, "engram_head_dim", d)).empty()) return e;
+        G.engram_dim = (int64_t) d;
+        if (!(e = detail::json_num(cfg->s, "engram_max_ngram_size", d)).empty()) return e;
+        G.engram_ngram = (int64_t) d;
+    } else {
+        if (!(e = detail::u64(g, P + "engram.head_count", G.engram_heads)).empty()) return "no deepseek41.config and " + e;
+        if (!(e = detail::u64(g, P + "engram.key_length", G.engram_dim)).empty()) return "no deepseek41.config and " + e;
+        if (!(e = detail::u64(g, P + "engram.max_ngram_size", G.engram_ngram)).empty()) return "no deepseek41.config and " + e;
+    }
+    detail::u64(g, P + "engram.compressed_vocab_size", G.engram_cvocab);   // llama.cpp writes no such key
     if (!(e = detail::arr(g, P + "engram.layer_ids", G.engram_layers)).empty()) return e;
-    if (!(e = detail::arr(g, P + "engram.rows", G.engram_rows)).empty()) return e;
+    detail::arr(g, P + "engram.rows", G.engram_rows);   // llama.cpp writes none: the primes tile the table exactly
     const std::string & path = g.path();
     std::vector<int64_t> tm, pr;
     if (!(e = ds41_read_int_array(path, P + "engram.token_map", tm)).empty()) return e;
@@ -276,25 +419,49 @@ inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G)
     if (!(e = ds41_read_int_array(path, P + "engram.multipliers", G.engram_mult)).empty()) return e;
     if ((int64_t) tm.size() != G.vocab) return "engram.token_map size";
     G.engram_token_map.assign(tm.begin(), tm.end());
+    // pad_id is already compressed in the canonical format. Maya's pad_token_id is a tokenizer id,
+    // not an alias for that value: even when both happen to be equal in a real release, map it explicitly.
+    if (g.get(P + "engram.pad_id")) {
+        if (!(e = detail::u64(g, P + "engram.pad_id", G.engram_pad)).empty()) return e;
+    } else {
+        int64_t token = 0;
+        if (!(e = detail::u64(g, P + "engram.pad_token_id", token)).empty()) return e;
+        if (token < 0 || token >= (int64_t) tm.size()) return "engram.pad_token_id out of range";
+        G.engram_pad = G.engram_token_map[(size_t) token];
+    }
     G.engram_primes.assign(pr.begin(), pr.end());
     const int64_t nel = (int64_t) G.engram_layers.size();
     if ((int64_t) G.engram_primes.size() != nel * (G.engram_ngram - 1) * G.engram_heads ||
-        (int64_t) G.engram_mult.size() != nel * G.engram_ngram || (int64_t) G.engram_rows.size() != nel)
+        (int64_t) G.engram_mult.size() != nel * G.engram_ngram ||
+        ((int64_t) G.engram_rows.size() != nel && !G.engram_rows.empty()))
         return "engram arrays do not match its shape";
+    bool derived = G.engram_rows.empty();
     for (int64_t i = 0; i < nel; ++i) {   // the bucket ranges tile the table exactly (v41_gguf_meta checks the same)
         uint64_t s = 0;
         for (int64_t j = 0; j < (G.engram_ngram - 1) * G.engram_heads; ++j)
             s += G.engram_primes[(size_t) (i * (G.engram_ngram - 1) * G.engram_heads + j)];
+        if (derived) { G.engram_rows.push_back((int64_t) s); continue; }
         if ((int64_t) s != G.engram_rows[(size_t) i]) return "engram primes do not tile the table";
     }
+    if (G.engram_cvocab <= 0) {   // with no compressed_vocab_size key, the token map is what defines it
+        uint32_t mx = 0;
+        for (uint32_t c : G.engram_token_map) if (c > mx) mx = c;
+        G.engram_cvocab = (int64_t) mx + 1;
+        derived = true;
+    }
+    if (derived)
+        std::fprintf(stderr, "v41 geometry: Engram rows / compressed vocabulary derived - %s rows, %lld ids\n",
+                     detail::join(G.engram_rows).c_str(), (long long) G.engram_cvocab);
     detail::u64(g, "tokenizer.ggml.bos_token_id", G.bos);
     detail::u64(g, "tokenizer.ggml.eos_token_id", G.eos);
     return {};
 }
 
 /// The full tensor map + per-layer expert tiers.  `layers`: the blocks the file must hold (a partial test file
-/// holds a subset - pass them; the real file holds 0..n_layer-1).
-inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, const std::vector<int64_t> & layers) {
+/// holds a subset - pass them; the real file holds 0..n_layer-1).  Fills `G.rename` / `G.want` / `G.engram_tables`
+/// with what the file actually calls and stores, which is not always what the engine asks for (see the note above).
+inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, const std::vector<int64_t> & layers,
+                                     bool external_experts = false) {
     std::map<std::string, std::pair<std::vector<uint64_t>, uint32_t>> want;   // name -> (shape GGUF order, type; ~0 = any)
     const uint32_t ANY = ~0u;
     auto add = [&](const std::string & n, std::vector<uint64_t> sh, uint32_t t) { want[n] = { std::move(sh), t }; };
@@ -340,11 +507,18 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
         add(b + "ffn_up_shexp.weight", { D, FF }, ty::Q8_0);
         add(b + "ffn_down_shexp.weight", { FF, D }, ty::Q8_0);
         if (G.engram_slot(l) >= 0) {
-            add(b + "engram_q_norm.weight", { D, HC }, ty::F32);
-            add(b + "engram_k_norm.weight", { D, HC }, ty::F32);
+            if (m.find(b + "engram_gate.weight")) {
+                add(b + "engram_gate.weight", { D, HC }, ty::F32);
+            } else {
+                add(b + "engram_q_norm.weight", { D, HC }, ty::F32);
+                add(b + "engram_k_norm.weight", { D, HC }, ty::F32);
+            }
             add(b + "engram_kv.weight", { (uint64_t) ((G.engram_ngram - 1) * G.engram_heads * G.engram_dim), (HC + 1) * D }, ty::F16);
         }
         // routed experts: uniform role tensors or per-type tensors + the I32 maps
+        if (external_experts && !m.find(b + "ffn_gate_exps.weight") && !m.find(b + "ffn_up_exps.weight") &&
+            !m.find(b + "ffn_down_exps.weight") && !m.find(b + "ffn_exps_gu_type") && !m.find(b + "ffn_exps_down_type"))
+            continue;
         Ds41ExpertMap & X = G.experts[(size_t) l];
         X.gu_type.assign(NE, -1); X.d_type.assign(NE, -1); X.gu_slot.assign(NE, -1); X.d_slot.assign(NE, -1);
         for (int k = 0; k < 2; ++k) {   // 0 = gate+up, 1 = down
@@ -386,23 +560,49 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
         }
     }
     (void) ANY;
-    // every predicted tensor present with its shape/type; every file tensor predicted
+    // Every predicted tensor present with its shape; every file tensor predicted.  A file in llama.cpp's spelling
+    // calls three tensors by the checkpoint's names and stores dense matrices in BF16 where the engine computes in
+    // F16: the alias is recorded so the loader can find the tensor, and converting the type is the loader's job.
+    G.rename.clear(); G.want.clear(); G.engram_tables.clear();
     for (const auto & [n, st] : want) {
         size_t s = 0;
         const TensorInfo * t = m.find(n, &s);
-        if (!t) return "missing tensor " + n;
+        if (!t) {
+            const std::string a = detail::tensor_name(n);
+            if (a.empty() || !(t = m.find(a, &s))) return "missing tensor " + n;
+            G.rename[a] = n;
+        }
         if (t->shape != st.first) {
             std::string a, w;
             for (auto x : t->shape) a += std::to_string(x) + " ";
             for (auto x : st.first) w += std::to_string(x) + " ";
             return n + ": shape [" + a + "] expected [" + w + "]";
         }
-        if (t->type != st.second) return n + ": type " + std::string(ggml_type_name(t->type)) + " expected " + ggml_type_name(st.second);
+        G.want[n] = st.second;   // the type the engine reads it as; the file may store another.  Whether that type
+                                 // can be dequantized is the loader's knowledge, not the header's (ds41_dense.cpp
+                                 // checks ggml's traits before it converts anything).
         if (!m.in_bounds(*t, s)) return n + ": out of bounds";
     }
+    // The Engram tables: the engine's own file keeps them out of the GGUF (HF safetensors, --engram DIRS);
+    // llama.cpp releases carry them as Q8_0 or Q6_K tensors, which ds41_engram reads straight off the shard.
+    std::set<std::string> tables;
+    for (size_t i = 0; i < G.engram_layers.size(); ++i) {
+        const std::string n = "blk." + std::to_string(G.engram_layers[i]) + ".engram_embd.weight";
+        size_t s = 0;
+        const TensorInfo * t = m.find(n, &s);
+        if (!t) continue;
+        if ((t->type != ty::Q8_0 && t->type != ty::Q6_K) || t->shape.size() != 2 || t->shape[0] != (uint64_t) G.engram_dim ||
+            t->shape[1] != (uint64_t) G.engram_rows[i] || !m.in_bounds(*t, s))
+            return "Engram table " + n + " is not this model's Q8_0 or Q6_K table";
+        tables.insert(n);
+        G.engram_tables.push_back(n);
+    }
+    // Every tensor in the file is one the engine asked for: by its own name, as an Engram table, or under the
+    // alias the loop above resolved (a llama.cpp file calls the three Engram tensors by the checkpoint's names).
     for (size_t s = 0; s < m.size(); ++s)
         for (const auto & t : m.shard(s).tensors())
-            if (!want.count(t.name)) return "unexpected tensor " + t.name;
+            if (!want.count(t.name) && !tables.count(t.name) && !G.rename.count(t.name))
+                return "unexpected tensor " + t.name;
     return {};
 }
 
